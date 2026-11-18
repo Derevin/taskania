@@ -118,8 +118,6 @@ pub struct App {
     pub message: Option<Message>,
     /// Lines the peek shows at once, for paging; kept by the renderer.
     pub peek_rows: usize,
-    /// Where the cursor lands after the next listing (a created task).
-    focus: Option<(usize, TaskKey)>,
     last_key: Instant,
 }
 
@@ -149,7 +147,6 @@ impl App {
             pending: vec![],
             message: None,
             peek_rows: 20,
-            focus: None,
             last_key: now,
         }
     }
@@ -188,11 +185,6 @@ impl App {
             if let Some(column) = self.columns.get_mut(col) {
                 column.rows = listing::parse(&out);
             }
-        }
-        if let Some((col, key)) = self.focus.take()
-            && let Some(row) = self.find(col, &key)
-        {
-            self.cursor = Some(Cursor { col, row, key });
         }
         if let Some(c) = self.cursor.clone() {
             self.cursor = match self.find(c.col, &c.key) {
@@ -667,9 +659,6 @@ impl App {
                         .map(str::trim)
                         .rfind(|l| !l.is_empty())
                         .unwrap_or("");
-                    if let Some(key) = TaskKey::from_filename(file) {
-                        self.focus = Some((job.col, key));
-                    }
                     done = format!("created {}", file.strip_suffix(".md").unwrap_or(file));
                 }
                 self.info(done, now);
@@ -853,7 +842,7 @@ fn locate(project_dir: &Path, key: &TaskKey) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{PROJ, TempDir, WIDGET, app, key};
+    use crate::testutil::{PROJ, TempDir, app, key};
     use std::os::unix::process::ExitStatusExt;
 
     fn chars(a: &mut App, s: &str) {
@@ -1390,22 +1379,26 @@ mod tests {
     }
 
     #[test]
-    fn a_created_task_gets_the_cursor() {
-        let mut a = app(true);
+    fn creating_a_task_keeps_the_cursor_where_it_was() {
+        let mut a = app(false);
+        for _ in 0..3 {
+            key(&mut a, KeyCode::Down);
+        }
+        assert_eq!(on(&a), Some("0:N002".into()));
         key(&mut a, KeyCode::Char('n'));
-        key(&mut a, KeyCode::Tab);
         chars(&mut a, "new one");
         let Some(Effect::Run(job)) = key(&mut a, KeyCode::Enter).into_iter().next() else {
             panic!()
         };
         a.on_job_done(
             job,
-            Ok("[main 1a2b3c] Add: new-one\nN009-new-one.md\n".into()),
+            Ok("[main 1a2b3c] Add: new-one\nA009-new-one.md\n".into()),
             Instant::now(),
         );
-        assert_eq!(a.message.as_ref().unwrap().text, "created N009-new-one");
-        a.set_listings(vec![PROJ.into(), format!("{WIDGET}\n  N009 new-one")]);
-        assert_eq!(on(&a), Some("1:N009".into()));
+        assert_eq!(a.message.as_ref().unwrap().text, "created A009-new-one");
+        let with_new = PROJ.replace("TODO (3)\n", "TODO (4)\n  A009 new-one\n");
+        a.set_listings(vec![with_new]);
+        assert_eq!(on(&a), Some("0:N002".into()));
     }
 
     #[test]
