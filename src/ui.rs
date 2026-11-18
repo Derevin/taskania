@@ -14,7 +14,7 @@ use crate::app::{App, Form, MOVES, Mode};
 use crate::listing::Task;
 
 const GUTTER: usize = 2;
-const IDLE_HINTS: [&str; 2] = ["(↑↓ select, n new, ←→ d l s q)", "(↑↓ ←→ d l s n q)"];
+const IDLE_HINTS: [&str; 2] = ["(↑↓ select, n new, ←→ d s q)", "(↑↓ ←→ d s n q)"];
 const CURSOR_HINTS: [&str; 2] = [
     "(⏎ peek, e edit, m move, p prio, n new, esc)",
     "(⏎ e m p n esc)",
@@ -45,35 +45,6 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) -> Option<Position> {
         buf.set_line(foot.x, foot.y, &bar(app, foot.width as usize), foot.width);
     }
     None
-}
-
-/// The frame as plain text, the way `--once` prints it: the body down to its
-/// last non-blank line, then the bar.
-pub fn frame_text(buf: &Buffer) -> String {
-    let mut lines: Vec<String> = (0..buf.area.height)
-        .map(|y| row_text(buf, buf.area.y + y))
-        .collect();
-    let bar = lines.pop().unwrap_or_default();
-    while lines.last().is_some_and(String::is_empty) {
-        lines.pop();
-    }
-    lines.push(bar);
-    lines.join("\n") + "\n"
-}
-
-fn row_text(buf: &Buffer, y: u16) -> String {
-    let mut s = String::new();
-    let mut hidden = 0;
-    for x in buf.area.x..buf.area.right() {
-        if hidden > 0 {
-            hidden -= 1;
-            continue;
-        }
-        let sym = buf[(x, y)].symbol();
-        s.push_str(sym);
-        hidden = sym.cell_width().saturating_sub(1);
-    }
-    s.trim_end().to_string()
 }
 
 /// Column widths for a pane `cols` wide whose second list's longest line is
@@ -190,13 +161,9 @@ fn render_body(area: Rect, buf: &mut Buffer, app: &mut App) {
 
 fn bar(app: &App, width: usize) -> Line<'static> {
     match &app.mode {
-        Mode::Move { task, worker } => move_menu(task, worker.as_deref()),
-        Mode::Prio { task, worker } => {
-            let mut spans = vec![Span::raw(format!(
-                "priority for {}{}: ",
-                task.name(),
-                tag(worker.as_deref())
-            ))];
+        Mode::Move(task) => move_menu(task),
+        Mode::Prio(task) => {
+            let mut spans = vec![Span::raw(format!("priority for {}: ", task.name()))];
             spans.push(Span::styled(
                 "a-z",
                 Style::new().add_modifier(Modifier::BOLD),
@@ -208,13 +175,9 @@ fn bar(app: &App, width: usize) -> Line<'static> {
     }
 }
 
-fn tag(worker: Option<&str>) -> String {
-    worker.map(|w| format!(" [{w}]")).unwrap_or_default()
-}
-
-/// The move menu: every target, the ones the script would refuse dimmed.
-fn move_menu(task: &Task, worker: Option<&str>) -> Line<'static> {
-    let mut spans = vec![Span::raw(format!("move {}{} to", task.name(), tag(worker)))];
+/// The move menu: every target, the ones the move would refuse dimmed.
+fn move_menu(task: &Task) -> Line<'static> {
+    let mut spans = vec![Span::raw(format!("move {} to", task.name()))];
     for (key, to) in MOVES {
         let style = if task.status.can_move_to(to) {
             Style::new()
@@ -491,27 +454,11 @@ fn clip(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{PROJ, TempDir, WIDGET, app, key};
+    use crate::testutil::{PROJ, app, draw, key, lines, put};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyCode;
     use std::fs;
-
-    fn draw(a: &mut App, w: u16, h: u16) -> Terminal<TestBackend> {
-        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| {
-            if let Some(pos) = render(f.area(), f.buffer_mut(), a) {
-                f.set_cursor_position(pos);
-            }
-        })
-        .unwrap();
-        t
-    }
-
-    fn lines(t: &Terminal<TestBackend>) -> Vec<String> {
-        let buf = t.backend().buffer();
-        (0..buf.area.height).map(|y| row_text(buf, y)).collect()
-    }
 
     fn modifier(t: &Terminal<TestBackend>, x: u16, y: u16) -> Modifier {
         t.backend().buffer()[(x, y)].modifier
@@ -519,7 +466,7 @@ mod tests {
 
     #[test]
     fn the_idle_frame_is_the_listing_and_the_bar() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         let t = draw(&mut a, 60, 12);
         let got = lines(&t);
         let want: Vec<&str> = PROJ.lines().collect();
@@ -534,7 +481,7 @@ mod tests {
 
     #[test]
     fn a_second_project_sits_flush_right_and_names_itself_in_the_bar() {
-        let mut a = app(true);
+        let (mut a, _tmp) = app(true);
         let t = draw(&mut a, 80, 12);
         let got = lines(&t);
         assert_eq!(
@@ -560,9 +507,23 @@ mod tests {
 
     #[test]
     fn every_line_is_clipped_and_the_second_column_capped_at_half() {
-        let mut a = app(true);
-        let long = format!("{WIDGET}\n  N009 {}", "x".repeat(70));
-        a.set_listings(vec![format!("TODO (1)\n  N001 {}", "y".repeat(90)), long]);
+        let (mut a, tmp) = app(true);
+        let long = |c: &str, n| format!("{}.md", c.repeat(n));
+        put(
+            tmp.path(),
+            "proj",
+            "todo",
+            &format!("N004-{}", long("y", 90)),
+            "",
+        );
+        put(
+            tmp.path(),
+            "widget",
+            "todo",
+            &format!("N009-{}", long("x", 70)),
+            "",
+        );
+        a.relist();
         let t = draw(&mut a, 80, 12);
         let got = lines(&t);
         assert!(got.iter().all(|l| text_width(l) <= 80));
@@ -585,7 +546,7 @@ mod tests {
 
     #[test]
     fn a_tall_list_ends_in_a_count_of_what_is_cut() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         let t = draw(&mut a, 40, 6);
         let got = lines(&t);
         assert_eq!(&got[..4], &PROJ.lines().take(4).collect::<Vec<_>>()[..]);
@@ -594,7 +555,7 @@ mod tests {
 
     #[test]
     fn the_cursor_row_is_reversed_across_its_column() {
-        let mut a = app(true);
+        let (mut a, _tmp) = app(true);
         key(&mut a, KeyCode::Down); // H010, row 1
         let t = draw(&mut a, 80, 12);
         assert!(modifier(&t, 0, 1).contains(Modifier::REVERSED));
@@ -615,7 +576,7 @@ mod tests {
 
     #[test]
     fn only_the_cursors_column_scrolls() {
-        let mut a = app(true);
+        let (mut a, _tmp) = app(true);
         for _ in 0..5 {
             key(&mut a, KeyCode::Down); // N050, row 8 of 9
         }
@@ -657,11 +618,11 @@ mod tests {
 
     #[test]
     fn the_bar_drops_hints_before_the_second_name() {
-        let mut a = app(true);
+        let (mut a, _tmp) = app(true);
         let t = draw(&mut a, 64, 4);
         let bar = &lines(&t)[3];
         assert!(bar.ends_with(" widget"), "{bar}");
-        assert!(bar.contains("(↑↓ ←→ d l s n q)"), "the short hints: {bar}");
+        assert!(bar.contains("(↑↓ ←→ d s n q)"), "the short hints: {bar}");
         let t = draw(&mut a, 45, 4);
         assert_eq!(
             lines(&t)[3],
@@ -673,13 +634,13 @@ mod tests {
 
     #[test]
     fn a_result_outranks_the_second_name() {
-        let mut a = app(true);
+        let (mut a, _tmp) = app(true);
         a.in_flight = 1;
         let t = draw(&mut a, 80, 4);
         assert!(lines(&t)[3].contains(" syncing…"));
         a.in_flight = 0;
         a.message = Some(crate::app::Message::test(
-            "error: a long line from the script's stderr, cut to fit",
+            "error: a long line from git's stderr, cut to fit",
             true,
         ));
         let t = draw(&mut a, 80, 4);
@@ -693,22 +654,14 @@ mod tests {
     }
 
     #[test]
-    fn the_move_menu_dims_what_the_script_would_refuse() {
-        let mut a = app(false);
-        let tmp = TempDir::new();
-        fs::create_dir_all(tmp.path().join("proj/todo")).unwrap();
-        fs::write(
-            tmp.path().join("proj/todo/N001-alpha.md"),
-            "# A\nWorker: hlab-2\n",
-        )
-        .unwrap();
-        a.tasks_root = tmp.path().to_path_buf();
+    fn the_move_menu_dims_what_the_move_would_refuse() {
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down); // N001, todo
         key(&mut a, KeyCode::Char('m'));
         let t = draw(&mut a, 80, 12);
         let bar = &lines(&t)[11];
-        let menu = "move N001 [hlab-2] to  t todo  p planned  s stale  d done  c canceled  esc";
+        let menu = "move N001 to  t todo  p planned  s stale  d done  c canceled  esc";
         assert_eq!(bar, menu);
         let dim = |k: &str| modifier(&t, menu.find(k).unwrap() as u16, 11).contains(Modifier::DIM);
         assert!(dim("t todo") && dim("s stale"));
@@ -717,7 +670,7 @@ mod tests {
 
     #[test]
     fn the_priority_prompt_takes_the_bar() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Char('p'));
         let t = draw(&mut a, 80, 12);
@@ -726,7 +679,7 @@ mod tests {
 
     #[test]
     fn the_form_is_two_boxes_on_the_bottom_rows() {
-        let mut a = app(true);
+        let (mut a, _tmp) = app(true);
         key(&mut a, KeyCode::Char('n'));
         for c in "fix the sensor".chars() {
             key(&mut a, KeyCode::Char(c));
@@ -760,7 +713,7 @@ mod tests {
 
     #[test]
     fn a_long_title_scrolls_to_keep_the_text_cursor_in_its_box() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Char('n'));
         for c in "abcdefghijklmnopqrstuvwxyz".chars() {
             key(&mut a, KeyCode::Char(c));
@@ -772,12 +725,10 @@ mod tests {
 
     #[test]
     fn peek_overlays_the_pane_with_the_file() {
-        let mut a = app(false);
-        let tmp = TempDir::new();
-        fs::create_dir_all(tmp.path().join("proj/active")).unwrap();
-        let body = "# Busy\nWorker: hlab-7\n\nA paragraph long enough that it has to wrap at the pane's edge.\n";
+        let (mut a, tmp) = app(false);
+        let body =
+            "# Busy\nsecond\n\nA paragraph long enough that it has to wrap at the pane's edge.\n";
         fs::write(tmp.path().join("proj/active/H010-busy.md"), body).unwrap();
-        a.tasks_root = tmp.path().to_path_buf();
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Enter);
         let t = draw(&mut a, 30, 8);
@@ -788,7 +739,7 @@ mod tests {
             &got[1..6],
             [
                 "# Busy",
-                "Worker: hlab-7",
+                "second",
                 "",
                 "A paragraph long enough that",
                 "it has to wrap at the pane's"
@@ -799,21 +750,18 @@ mod tests {
 
         key(&mut a, KeyCode::PageDown);
         let got = lines(&draw(&mut a, 30, 7));
-        assert_eq!(got[1], "Worker: hlab-7", "scrolled to the end, no further");
+        assert_eq!(got[1], "second", "scrolled to the end, no further");
     }
 
     #[test]
     fn peek_says_when_the_file_is_empty_or_gone() {
-        let mut a = app(false);
-        let tmp = TempDir::new();
-        fs::create_dir_all(tmp.path().join("proj/todo")).unwrap();
-        fs::write(tmp.path().join("proj/todo/N001-alpha.md"), "").unwrap();
-        a.tasks_root = tmp.path().to_path_buf();
+        let (mut a, tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Down); // N002, empty
         key(&mut a, KeyCode::Enter);
         assert_eq!(lines(&draw(&mut a, 30, 6))[1], "(empty file)");
-        fs::remove_file(tmp.path().join("proj/todo/N001-alpha.md")).unwrap();
+        fs::remove_file(tmp.path().join("proj/todo/N002-beta.md")).unwrap();
         a.refresh_peek();
         assert_eq!(lines(&draw(&mut a, 30, 6))[1], "(the file is gone)");
     }
@@ -825,19 +773,5 @@ mod tests {
         assert_eq!(wrap("a\n\nb\n", 10), ["a", "", "b"]);
         assert_eq!(wrap("\tx", 10), ["    x"]);
         assert_eq!(wrap("", 10), [""]);
-    }
-
-    #[test]
-    fn the_plain_frame_drops_trailing_blank_rows_but_keeps_the_bar() {
-        let mut a = app(false);
-        a.set_listings(vec!["TODO (1)\n  N001 alpha".into()]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 6));
-        render(buf.area, &mut buf, &mut a);
-        let text = frame_text(&buf);
-        let got: Vec<&str> = text.lines().collect();
-        assert_eq!(got.len(), 3);
-        assert_eq!(&got[..2], ["TODO (1)", "  N001 alpha"]);
-        assert!(got[2].starts_with("proj, done between"));
-        assert!(text.ends_with('\n'));
     }
 }

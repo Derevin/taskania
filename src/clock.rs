@@ -1,4 +1,4 @@
-//! The local calendar date, for the bar's done window.
+//! The local calendar date, for the bar's done window and the rows' dates.
 //!
 //! Days back are counted on the calendar, not as multiples of 24 hours, so a
 //! daylight-saving shift near midnight cannot land the marker a day off.
@@ -17,10 +17,15 @@ const WEEKDAYS: [&str; 7] = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
 
 impl Date {
     pub fn today() -> Date {
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        Date::of(SystemTime::now())
+    }
+
+    /// The local date `t` falls on.
+    pub fn of(t: SystemTime) -> Date {
+        let secs = match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_secs() as i64,
+            Err(e) => -(e.duration().as_secs_f64().ceil() as i64),
+        };
         local_date(secs).unwrap_or_else(|| Date::from_days(secs.div_euclid(86_400)))
     }
 

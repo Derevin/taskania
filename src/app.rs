@@ -1,4 +1,4 @@
-//! Taskania's state and what each key does to it: a state machine fed key
+//! The dashboard's state and what each key does to it: a state machine fed key
 //! events, listings and job results. It reads task files but changes nothing
 //! itself; every change comes back as an [`Effect`] for the loop to carry out.
 
@@ -11,14 +11,33 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::clock::Date;
-use crate::engine::{Call, ListOpts};
-use crate::listing::{self, Row, Status, Task, TaskKey};
+use crate::engine::Call;
+use crate::listing::{self, Row, Spec, Status, Task, TaskKey};
 use crate::watch::{self, Stamp};
 
 /// How long the cursor outlives the last key.
 pub const CURSOR_TIMEOUT: Duration = Duration::from_secs(60);
 const INFO_FOR: Duration = Duration::from_secs(5);
 const ERROR_FOR: Duration = Duration::from_secs(30);
+
+/// What the listing shows, each toggled by a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListOpts {
+    /// Days of done and canceled below the open queue.
+    pub recent: u32,
+    pub dates: bool,
+    pub stale: bool,
+}
+
+impl Default for ListOpts {
+    fn default() -> Self {
+        ListOpts {
+            recent: 7,
+            dates: false,
+            stale: false,
+        }
+    }
+}
 
 pub struct Config {
     pub primary: String,
@@ -45,8 +64,8 @@ pub struct Cursor {
 pub enum Mode {
     Normal,
     Peek(Peek),
-    Move { task: Task, worker: Option<String> },
-    Prio { task: Task, worker: Option<String> },
+    Move(Task),
+    Prio(Task),
     Form(Form),
 }
 
@@ -74,7 +93,7 @@ pub struct Message {
     until: Instant,
 }
 
-/// A script call queued for the worker thread, with what the app needs back.
+/// A change queued for the job thread, with what the app needs back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Job {
     pub call: Call,
@@ -177,14 +196,24 @@ impl App {
 
     // --- listings ----------------------------------------------------------
 
-    /// New listings, one per column in order. The cursor follows its task;
-    /// when the task left the view it stays at its row, on whatever task row
-    /// is nearest.
-    pub fn set_listings(&mut self, outputs: Vec<String>) {
-        for (col, out) in outputs.into_iter().enumerate() {
-            if let Some(column) = self.columns.get_mut(col) {
-                column.rows = listing::parse(&out);
-            }
+    /// List every column again. The cursor follows its task; when the task
+    /// left the view it stays at its row, on whatever task row is nearest.
+    pub fn relist(&mut self) {
+        let spec = Spec {
+            statuses: Spec::open(self.opts.stale),
+            recent: Some(self.opts.recent),
+            dates: self.opts.dates,
+            verbose: false,
+            ids: false,
+        };
+        for column in &mut self.columns {
+            let dir = self.tasks_root.join(&column.project);
+            column.rows = listing::rows(&dir, &spec).unwrap_or_else(|e| {
+                vec![Row {
+                    text: e,
+                    task: None,
+                }]
+            });
         }
         if let Some(c) = self.cursor.clone() {
             self.cursor = match self.find(c.col, &c.key) {
@@ -196,7 +225,7 @@ impl App {
         }
         // A menu belongs to the task it was opened on.
         let menu_task = match &self.mode {
-            Mode::Move { task, .. } | Mode::Prio { task, .. } => Some(task.key()),
+            Mode::Move(task) | Mode::Prio(task) => Some(task.key()),
             _ => None,
         };
         if let Some(key) = menu_task
@@ -290,8 +319,8 @@ impl App {
         match self.mode {
             Mode::Normal => self.normal_key(key.code, now),
             Mode::Peek(_) => self.peek_key(key.code),
-            Mode::Move { .. } => self.move_key(key.code),
-            Mode::Prio { .. } => self.prio_key(key.code, now),
+            Mode::Move(_) => self.move_key(key.code),
+            Mode::Prio(_) => self.prio_key(key.code, now),
             Mode::Form(_) => self.form_key(key.code),
         }
     }
@@ -309,10 +338,6 @@ impl App {
             }
             KeyCode::Char('d') => {
                 self.opts.dates = !self.opts.dates;
-                vec![Effect::Relist]
-            }
-            KeyCode::Char('l' | 'L') => {
-                self.opts.labs = !self.opts.labs;
                 vec![Effect::Relist]
             }
             KeyCode::Char('s') => {
@@ -430,19 +455,15 @@ impl App {
     }
 
     fn open_move(&mut self) -> Vec<Effect> {
-        let Some((col, task)) = self.cursor_task() else {
+        let Some((_, task)) = self.cursor_task() else {
             return vec![];
         };
-        let worker = read_worker(&self.task_path(col, task));
-        self.mode = Mode::Move {
-            task: task.clone(),
-            worker,
-        };
+        self.mode = Mode::Move(task.clone());
         vec![]
     }
 
     fn open_prio(&mut self, now: Instant) -> Vec<Effect> {
-        let Some((col, task)) = self.cursor_task() else {
+        let Some((_, task)) = self.cursor_task() else {
             return vec![];
         };
         if task.status.is_closed() {
@@ -454,11 +475,7 @@ impl App {
             self.info(text, now);
             return vec![];
         }
-        let worker = read_worker(&self.task_path(col, task));
-        self.mode = Mode::Prio {
-            task: task.clone(),
-            worker,
-        };
+        self.mode = Mode::Prio(task.clone());
         vec![]
     }
 
@@ -504,10 +521,10 @@ impl App {
             },
             _ => return vec![],
         };
-        let Mode::Move { task, .. } = &self.mode else {
+        let Mode::Move(task) = &self.mode else {
             return vec![];
         };
-        // A target the script would refuse is inert.
+        // A target the move would refuse is inert.
         if !task.status.can_move_to(to) {
             return vec![];
         }
@@ -544,7 +561,7 @@ impl App {
             KeyCode::Char(c) if c.is_ascii_alphabetic() => c.to_ascii_uppercase(),
             _ => return vec![],
         };
-        let Mode::Prio { task, .. } = std::mem::replace(&mut self.mode, Mode::Normal) else {
+        let Mode::Prio(task) = std::mem::replace(&mut self.mode, Mode::Normal) else {
             return vec![];
         };
         let Some(col) = self.cursor.as_ref().map(|c| c.col) else {
@@ -733,10 +750,7 @@ impl App {
     /// The cursor hides after a minute without a key, restoring the idle
     /// frame; a peek or a half-typed form stays until dismissed.
     pub fn tick(&mut self, now: Instant) {
-        let row_bound = matches!(
-            self.mode,
-            Mode::Normal | Mode::Move { .. } | Mode::Prio { .. }
-        );
+        let row_bound = matches!(self.mode, Mode::Normal | Mode::Move(_) | Mode::Prio(_));
         if self.cursor.is_some() && row_bound && now.duration_since(self.last_key) >= CURSOR_TIMEOUT
         {
             self.hide();
@@ -814,14 +828,6 @@ pub const MOVES: [(char, Status); 5] = [
     ('c', Status::Canceled),
 ];
 
-/// The task file's `Worker:` stamp, the lab holding it.
-fn read_worker(path: &Path) -> Option<String> {
-    let text = fs::read_to_string(path).ok()?;
-    text.lines()
-        .find_map(|l| l.strip_prefix("Worker: "))
-        .map(|w| w.trim().to_string())
-}
-
 /// A task's file wherever it now sits in the project, by id and slug.
 fn locate(project_dir: &Path, key: &TaskKey) -> Option<PathBuf> {
     Status::ALL.iter().find_map(|s| {
@@ -842,8 +848,14 @@ fn locate(project_dir: &Path, key: &TaskKey) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{PROJ, TempDir, app, key};
+    use crate::testutil::{PROJ, app, key, put};
     use std::os::unix::process::ExitStatusExt;
+
+    /// The first column's rows, as drawn.
+    fn listed(a: &App) -> String {
+        let rows: Vec<&str> = a.columns[0].rows.iter().map(|r| r.text.as_str()).collect();
+        rows.join("\n")
+    }
 
     fn chars(a: &mut App, s: &str) {
         for c in s.chars() {
@@ -869,29 +881,29 @@ mod tests {
             .collect()
     }
 
-    /// A tasks root on disk holding the files the PROJ listing names, and the
-    /// first of WIDGET's.
-    fn on_disk(a: &mut App) -> TempDir {
-        let tmp = TempDir::new();
-        for (project, dir, file, body) in [
-            ("proj", "active", "H010-busy.md", "# Busy\nWorker: hlab-7\n\nbody\n"),
-            ("proj", "todo", "N001-alpha.md", "# Alpha\n\nfirst line\n"),
-            ("proj", "todo", "N002-beta.md", ""),
-            ("proj", "todo", "N003-gamma.md", "# Gamma\n"),
-            ("proj", "done", "N050-shipped.md", "# Shipped\n"),
-            ("widget", "todo", "N007-left-pad.md", "# Pad\nWorker: hlab-9\n"),
-        ] {
-            let d = tmp.path().join(project).join(dir);
-            fs::create_dir_all(&d).unwrap();
-            fs::write(d.join(file), body).unwrap();
-        }
-        a.tasks_root = tmp.path().to_path_buf();
-        tmp
+    #[test]
+    fn the_columns_list_the_task_files() {
+        let (a, _tmp) = app(true);
+        assert_eq!(listed(&a), PROJ);
+        let widget: Vec<&str> = a.columns[1].rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(widget.join("\n"), crate::testutil::WIDGET);
+    }
+
+    #[test]
+    fn a_missing_project_lists_as_its_error() {
+        let (mut a, tmp) = app(false);
+        fs::remove_dir_all(tmp.path().join("proj")).unwrap();
+        a.relist();
+        let dir = tmp.path().join("proj");
+        assert_eq!(
+            listed(&a),
+            format!("error: tasks dir not found: {}", dir.display())
+        );
     }
 
     #[test]
     fn the_cursor_starts_hidden_and_the_first_press_reveals_it() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         assert_eq!(on(&a), None);
         key(&mut a, KeyCode::Up);
         assert_eq!(on(&a), Some("0:H010".into()));
@@ -902,7 +914,7 @@ mod tests {
 
     #[test]
     fn the_cursor_lands_only_on_task_rows_tail_included() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         let mut seen = vec![];
         for _ in 0..8 {
             key(&mut a, KeyCode::Down);
@@ -918,7 +930,7 @@ mod tests {
 
     #[test]
     fn esc_hides_the_cursor() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Esc);
         assert_eq!(a.cursor, None);
@@ -926,7 +938,7 @@ mod tests {
 
     #[test]
     fn the_cursor_hides_after_a_minute_without_a_key() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         let t0 = Instant::now();
         a.on_key(KeyEvent::from(KeyCode::Down), t0);
         a.tick(t0 + Duration::from_secs(59));
@@ -940,7 +952,7 @@ mod tests {
 
     #[test]
     fn tab_hops_columns_and_reveals_in_the_second() {
-        let mut a = app(true);
+        let (mut a, _tmp) = app(true);
         key(&mut a, KeyCode::Tab);
         assert_eq!(on(&a), Some("1:N007".into()));
         key(&mut a, KeyCode::Tab);
@@ -952,14 +964,14 @@ mod tests {
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Tab);
         assert_eq!(on(&a), Some("1:N008".into()));
-        let mut solo = app(false);
+        let (mut solo, _solo) = app(false);
         key(&mut solo, KeyCode::Tab);
         assert_eq!(solo.cursor, None);
     }
 
     #[test]
     fn row_keys_never_act_without_a_cursor() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         for code in [
             KeyCode::Enter,
             KeyCode::Char('e'),
@@ -972,8 +984,8 @@ mod tests {
     }
 
     #[test]
-    fn the_bash_watch_keys_still_work() {
-        let mut a = app(false);
+    fn the_view_keys_toggle_what_is_listed() {
+        let (mut a, tmp) = app(false);
         assert_eq!(key(&mut a, KeyCode::Left), vec![Effect::Relist]);
         assert_eq!(a.opts.recent, 8);
         key(&mut a, KeyCode::Right);
@@ -982,18 +994,31 @@ mod tests {
         a.opts.recent = 1;
         assert_eq!(key(&mut a, KeyCode::Right), vec![]);
         assert_eq!(a.opts.recent, 1);
+
+        put(tmp.path(), "proj", "stale", "N004-paused.md", "");
+        a.relist();
+        assert!(!listed(&a).contains("STALE"), "stale starts hidden");
+        assert_eq!(key(&mut a, KeyCode::Char('s')), vec![Effect::Relist]);
+        a.relist();
+        assert!(listed(&a).contains("STALE (1)\n  N004 paused\nTODO (3)"));
+
         key(&mut a, KeyCode::Char('d'));
-        key(&mut a, KeyCode::Char('L'));
-        key(&mut a, KeyCode::Char('s'));
-        assert!(a.opts.dates && a.opts.labs && a.opts.stale);
-        key(&mut a, KeyCode::Char('l'));
-        assert!(!a.opts.labs);
+        a.relist();
+        let today = Date::today().dd_mm();
+        assert!(listed(&a).contains(&format!("  H010 busy ({today})")));
+        assert!(a.opts.dates && a.opts.stale);
+
+        a.opts.recent = 0;
+        a.relist();
+        assert!(!listed(&a).contains("DONE"), "an empty window hides done");
+
+        assert_eq!(key(&mut a, KeyCode::Char('l')), vec![], "no lab tags");
         assert_eq!(key(&mut a, KeyCode::Char('q')), vec![Effect::Quit]);
     }
 
     #[test]
     fn alt_keys_are_tmuxs_and_ctrl_c_quits() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         let alt_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT);
         assert_eq!(a.on_key(alt_q, Instant::now()), vec![]);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -1002,38 +1027,42 @@ mod tests {
 
     #[test]
     fn the_cursor_follows_its_task_across_a_reprioritize() {
-        let mut a = app(false);
+        let (mut a, tmp) = app(false);
         for _ in 0..3 {
             key(&mut a, KeyCode::Down);
         }
         assert_eq!(on(&a), Some("0:N002".into()));
-        let resorted = "ACTIVE (1)\n  H010 busy\nTODO (3)\n  A002 beta\n  N001 alpha\n  N003 gamma";
-        a.set_listings(vec![resorted.into()]);
+        let todo = tmp.path().join("proj/todo");
+        fs::rename(todo.join("N002-beta.md"), todo.join("A002-beta.md")).unwrap();
+        a.relist();
         assert_eq!(on(&a), Some("0:A002".into()));
-        assert_eq!(a.cursor.as_ref().unwrap().row, 3);
+        assert_eq!(a.cursor.as_ref().unwrap().row, 3, "sorted to the top");
     }
 
     #[test]
     fn a_cursor_whose_task_left_the_view_stays_on_its_row() {
-        let mut a = app(false);
+        let (mut a, tmp) = app(false);
         for _ in 0..3 {
             key(&mut a, KeyCode::Down);
         }
         assert_eq!(on(&a), Some("0:N002".into()));
-        a.set_listings(vec![PROJ.replace("  N002 beta\n", "")]);
+        fs::remove_file(tmp.path().join("proj/todo/N002-beta.md")).unwrap();
+        a.relist();
         assert_eq!(on(&a), Some("0:N003".into()));
-        a.set_listings(vec!["(none)".into()]);
+        fs::remove_dir_all(tmp.path().join("proj")).unwrap();
+        fs::create_dir_all(tmp.path().join("proj")).unwrap();
+        a.relist();
+        assert_eq!(listed(&a), "(none)");
         assert_eq!(a.cursor, None);
     }
 
     #[test]
-    fn a_move_offers_only_what_the_script_takes() {
-        let mut a = app(false);
-        let _tmp = on_disk(&mut a);
+    fn a_move_offers_only_what_the_move_takes() {
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down); // N001, todo
         key(&mut a, KeyCode::Char('m'));
-        assert!(matches!(a.mode, Mode::Move { .. }));
+        assert!(matches!(a.mode, Mode::Move(_)));
         assert_eq!(
             key(&mut a, KeyCode::Char('s')),
             vec![],
@@ -1041,16 +1070,15 @@ mod tests {
         );
         assert_eq!(key(&mut a, KeyCode::Char('t')), vec![], "already in todo");
         assert_eq!(key(&mut a, KeyCode::Char('x')), vec![]);
-        assert!(matches!(a.mode, Mode::Move { .. }));
+        assert!(matches!(a.mode, Mode::Move(_)));
         key(&mut a, KeyCode::Esc);
         assert!(matches!(a.mode, Mode::Normal));
         assert_eq!(on(&a), Some("0:N001".into()));
     }
 
     #[test]
-    fn a_move_runs_task_move_and_slides_the_cursor_to_the_next_row() {
-        let mut a = app(false);
-        let _tmp = on_disk(&mut a);
+    fn a_move_queues_the_move_and_slides_the_cursor_to_the_next_row() {
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down); // N001
         key(&mut a, KeyCode::Char('m'));
@@ -1099,8 +1127,7 @@ mod tests {
 
     #[test]
     fn moving_the_last_of_a_section_lands_on_the_one_above() {
-        let mut a = app(false);
-        let _tmp = on_disk(&mut a);
+        let (mut a, _tmp) = app(false);
         for _ in 0..4 {
             key(&mut a, KeyCode::Down); // N003
         }
@@ -1111,8 +1138,7 @@ mod tests {
 
     #[test]
     fn after_the_move_lands_the_cursor_stays_on_the_row_that_slid_in() {
-        let mut a = app(false);
-        let _tmp = on_disk(&mut a);
+        let (mut a, tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down); // N001
         let row = a.cursor.as_ref().unwrap().row;
@@ -1127,10 +1153,14 @@ mod tests {
         );
         assert_eq!(a.in_flight, 0);
         assert!(a.pending.is_empty());
-        a.set_listings(vec![
-            PROJ.replace("  N001 alpha\n", "")
-                .replace("  N050 shipped", "  N001 alpha\n  N050 shipped"),
-        ]);
+        let proj = tmp.path().join("proj");
+        fs::rename(
+            proj.join("todo/N001-alpha.md"),
+            proj.join("done/N001-alpha.md"),
+        )
+        .unwrap();
+        a.relist();
+        assert!(listed(&a).contains("DONE (2)\n"), "{}", listed(&a));
         assert_eq!(on(&a), Some("0:N002".into()));
         assert_eq!(a.cursor.as_ref().unwrap().row, row);
         assert_eq!(
@@ -1140,15 +1170,10 @@ mod tests {
     }
 
     #[test]
-    fn an_active_task_can_go_stale_and_the_menu_names_its_worker() {
-        let mut a = app(false);
-        let _tmp = on_disk(&mut a);
-        key(&mut a, KeyCode::Down); // H010, active, Worker: hlab-7
+    fn an_active_task_can_go_stale() {
+        let (mut a, _tmp) = app(false);
+        key(&mut a, KeyCode::Down); // H010, active
         key(&mut a, KeyCode::Char('m'));
-        let Mode::Move { worker, .. } = &a.mode else {
-            panic!("no menu")
-        };
-        assert_eq!(worker.as_deref(), Some("hlab-7"));
         let calls = jobs(key(&mut a, KeyCode::Char('s')));
         assert_eq!(
             calls,
@@ -1162,12 +1187,12 @@ mod tests {
 
     #[test]
     fn a_menu_closes_when_its_task_leaves_the_cursor() {
-        let mut a = app(false);
-        let _tmp = on_disk(&mut a);
+        let (mut a, tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down); // N001
         key(&mut a, KeyCode::Char('m'));
-        a.set_listings(vec![PROJ.replace("  N001 alpha\n", "")]);
+        fs::remove_file(tmp.path().join("proj/todo/N001-alpha.md")).unwrap();
+        a.relist();
         assert!(matches!(a.mode, Mode::Normal));
         assert_eq!(
             key(&mut a, KeyCode::Char('d')),
@@ -1177,9 +1202,8 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_job_shows_the_scripts_last_line() {
-        let mut a = app(false);
-        let _tmp = on_disk(&mut a);
+    fn a_failed_job_shows_its_error() {
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Char('m'));
@@ -1201,12 +1225,11 @@ mod tests {
 
     #[test]
     fn priority_takes_any_letter_and_refuses_closed_tasks() {
-        let mut a = app(false);
-        let _tmp = on_disk(&mut a);
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down); // N001
         key(&mut a, KeyCode::Char('p'));
-        assert!(matches!(a.mode, Mode::Prio { .. }));
+        assert!(matches!(a.mode, Mode::Prio(_)));
         assert_eq!(key(&mut a, KeyCode::Char('1')), vec![]);
         let calls = jobs(key(&mut a, KeyCode::Char('h')));
         assert_eq!(
@@ -1236,14 +1259,10 @@ mod tests {
 
     #[test]
     fn the_second_columns_task_is_acted_on_in_its_project() {
-        let mut a = app(true);
-        let _tmp = on_disk(&mut a);
+        let (mut a, _tmp) = app(true);
         key(&mut a, KeyCode::Tab); // N007, widget
         key(&mut a, KeyCode::Char('p'));
-        let Mode::Prio { worker, .. } = &a.mode else {
-            panic!("no priority prompt")
-        };
-        assert_eq!(worker.as_deref(), Some("hlab-9"));
+        assert!(matches!(a.mode, Mode::Prio(_)));
         assert_eq!(
             jobs(key(&mut a, KeyCode::Char('h'))),
             vec![Call::Reprioritize {
@@ -1253,10 +1272,7 @@ mod tests {
             }]
         );
         key(&mut a, KeyCode::Char('m'));
-        let Mode::Move { worker, .. } = &a.mode else {
-            panic!("no move menu")
-        };
-        assert_eq!(worker.as_deref(), Some("hlab-9"));
+        assert!(matches!(a.mode, Mode::Move(_)));
         assert_eq!(
             jobs(key(&mut a, KeyCode::Char('d'))),
             vec![Call::Move {
@@ -1272,16 +1288,14 @@ mod tests {
         let t0 = Instant::now();
         let later = t0 + CURSOR_TIMEOUT;
         for (open, survives) in [('m', false), ('p', false), ('n', true)] {
-            let mut a = app(false);
-            let _tmp = on_disk(&mut a);
+            let (mut a, _tmp) = app(false);
             a.on_key(KeyEvent::from(KeyCode::Down), t0);
             a.on_key(KeyEvent::from(KeyCode::Down), t0); // N001
             a.on_key(KeyEvent::from(KeyCode::Char(open)), t0);
             a.tick(later);
             assert_eq!(!matches!(a.mode, Mode::Normal), survives, "{open}");
         }
-        let mut a = app(false);
-        let _tmp = on_disk(&mut a);
+        let (mut a, _tmp) = app(false);
         a.on_key(KeyEvent::from(KeyCode::Down), t0);
         a.on_key(KeyEvent::from(KeyCode::Enter), t0);
         a.tick(later);
@@ -1290,7 +1304,7 @@ mod tests {
 
     #[test]
     fn the_form_creates_in_the_cursors_column() {
-        let mut a = app(true);
+        let (mut a, _tmp) = app(true);
         key(&mut a, KeyCode::Char('n'));
         let Mode::Form(f) = &a.mode else {
             panic!("no form")
@@ -1323,7 +1337,7 @@ mod tests {
 
     #[test]
     fn the_form_edits_its_title_and_letter() {
-        let mut a = app(true);
+        let (mut a, _tmp) = app(true);
         key(&mut a, KeyCode::Char('n'));
         chars(&mut a, "ac");
         key(&mut a, KeyCode::Left);
@@ -1357,7 +1371,7 @@ mod tests {
 
     #[test]
     fn a_blank_title_submits_nothing_and_esc_cancels() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Char('n'));
         chars(&mut a, "  ");
         assert_eq!(key(&mut a, KeyCode::Enter), vec![]);
@@ -1371,7 +1385,7 @@ mod tests {
 
     #[test]
     fn letters_in_the_form_are_text_not_commands() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Char('n'));
         assert_eq!(key(&mut a, KeyCode::Char('q')), vec![]);
         let Mode::Form(f) = &a.mode else { panic!() };
@@ -1380,7 +1394,7 @@ mod tests {
 
     #[test]
     fn creating_a_task_keeps_the_cursor_where_it_was() {
-        let mut a = app(false);
+        let (mut a, tmp) = app(false);
         for _ in 0..3 {
             key(&mut a, KeyCode::Down);
         }
@@ -1390,27 +1404,23 @@ mod tests {
         let Some(Effect::Run(job)) = key(&mut a, KeyCode::Enter).into_iter().next() else {
             panic!()
         };
-        a.on_job_done(
-            job,
-            Ok("[main 1a2b3c] Add: new-one\nA009-new-one.md\n".into()),
-            Instant::now(),
-        );
+        a.on_job_done(job, Ok("A009-new-one.md\n".into()), Instant::now());
         assert_eq!(a.message.as_ref().unwrap().text, "created A009-new-one");
-        let with_new = PROJ.replace("TODO (3)\n", "TODO (4)\n  A009 new-one\n");
-        a.set_listings(vec![with_new]);
+        put(tmp.path(), "proj", "todo", "A009-new-one.md", "");
+        a.relist();
+        assert!(listed(&a).contains("TODO (4)\n  A009 new-one\n"));
         assert_eq!(on(&a), Some("0:N002".into()));
     }
 
     #[test]
     fn peek_opens_scrolls_and_closes() {
-        let mut a = app(false);
-        let _tmp = on_disk(&mut a);
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Enter);
         let Mode::Peek(p) = &a.mode else {
             panic!("no peek")
         };
-        assert_eq!(p.text.as_deref(), Some("# Busy\nWorker: hlab-7\n\nbody\n"));
+        assert_eq!(p.text.as_deref(), Some("# Busy\n\nbody\n"));
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Up);
@@ -1431,8 +1441,7 @@ mod tests {
 
     #[test]
     fn peek_rereads_a_changed_file_and_follows_a_moved_one() {
-        let mut a = app(false);
-        let tmp = on_disk(&mut a);
+        let (mut a, tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down); // N001
         key(&mut a, KeyCode::Enter);
@@ -1455,7 +1464,7 @@ mod tests {
 
     #[test]
     fn editing_needs_an_editor() {
-        let mut a = app(false);
+        let (mut a, _tmp) = app(false);
         a.editor = None;
         key(&mut a, KeyCode::Down);
         assert_eq!(key(&mut a, KeyCode::Char('e')), vec![]);
@@ -1476,8 +1485,7 @@ mod tests {
 
     #[test]
     fn an_edit_that_changed_the_file_is_committed() {
-        let mut a = app(false);
-        let tmp = on_disk(&mut a);
+        let (mut a, tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down); // N001
         let edit = edit_of(&mut a);
@@ -1497,8 +1505,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_edit_commits_nothing() {
-        let mut a = app(false);
-        let _tmp = on_disk(&mut a);
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Down);
         let edit = edit_of(&mut a);
         assert_eq!(
@@ -1510,21 +1517,29 @@ mod tests {
 
     #[test]
     fn a_failed_editor_says_so() {
-        let mut a = app(false);
-        let _tmp = on_disk(&mut a);
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Down);
         let edit = edit_of(&mut a);
-        a.after_edit(edit.clone(), Ok(ExitStatus::from_raw(1 << 8)), Instant::now());
+        a.after_edit(
+            edit.clone(),
+            Ok(ExitStatus::from_raw(1 << 8)),
+            Instant::now(),
+        );
         assert!(a.message.as_ref().unwrap().text.contains("micro exited"));
         let gone = io::Error::from(io::ErrorKind::NotFound);
         a.after_edit(edit, Err(gone), Instant::now());
-        assert!(a.message.as_ref().unwrap().text.contains("cannot run micro"));
+        assert!(
+            a.message
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("cannot run micro")
+        );
     }
 
     #[test]
     fn an_edit_of_a_task_moved_while_open_commits_nothing() {
-        let mut a = app(false);
-        let tmp = on_disk(&mut a);
+        let (mut a, tmp) = app(false);
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Down); // N001
         let edit = edit_of(&mut a);

@@ -1,5 +1,5 @@
-//! Fixtures shared by the unit tests: temp dirs, recording stub scripts, and
-//! an app over canned listings.
+//! Fixtures shared by the unit tests: temp dirs, a tasks repo with a remote,
+//! and an app over task files on disk.
 
 use std::fs;
 use std::io::Write;
@@ -8,11 +8,14 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::buffer::CellWidth;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use crate::app::{App, Config, Effect};
+use crate::app::{App, Config, Effect, ListOpts};
 use crate::clock::Date;
-use crate::engine::{Engine, ListOpts};
+use crate::ui;
 
 /// A directory removed on drop.
 pub struct TempDir(PathBuf);
@@ -62,80 +65,84 @@ pub fn write_script(path: &Path, content: &str) {
     );
 }
 
-/// Stub scripts placed first on PATH. A recording stub logs each call as one
-/// line: its `TASK_PROJECT` (empty when unset), then its arguments.
-pub struct Stubs {
-    pub dir: PathBuf,
-    logdir: PathBuf,
-    _tmp: TempDir,
+pub fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-impl Stubs {
-    pub fn new() -> Stubs {
+/// A tasks repo cloned from a bare origin, every project with all its status
+/// directories.
+pub struct TasksRepo {
+    tmp: TempDir,
+}
+
+impl TasksRepo {
+    pub fn new(projects: &[&str]) -> TasksRepo {
         let tmp = TempDir::new();
-        let dir = tmp.path().join("bin");
-        let logdir = tmp.path().join("logs");
-        fs::create_dir_all(&dir).unwrap();
-        fs::create_dir_all(&logdir).unwrap();
-        Stubs {
-            dir,
-            logdir,
-            _tmp: tmp,
-        }
-    }
-
-    pub fn add(&self, name: &str, body: &str) {
-        write_script(&self.dir.join(name), &format!("#!/bin/bash\n{body}\n"));
-    }
-
-    pub fn record(&self, name: &str, prelude: &str) {
-        let log = self.logdir.join(format!("{name}.log"));
-        let log = log.display();
-        self.add(
-            name,
-            &format!(
-                "{prelude}\nprintf '%s\\t' \"${{TASK_PROJECT+TASK_PROJECT=$TASK_PROJECT}}\" \"$@\" >> '{log}'\nprintf '\\n' >> '{log}'\nexit 0"
-            ),
+        let origin = tmp.path().join("origin.git");
+        git(
+            tmp.path(),
+            &["init", "-q", "--bare", origin.to_str().unwrap()],
         );
+        git(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "tasks"],
+        );
+        let r = TasksRepo { tmp };
+        let root = r.root();
+        git(&root, &["config", "user.email", "t@t"]);
+        git(&root, &["config", "user.name", "T"]);
+        for p in projects {
+            for s in crate::listing::Status::ALL {
+                fs::create_dir_all(root.join(p).join(s.dir())).unwrap();
+            }
+        }
+        fs::write(root.join("README.md"), "tasks\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "init"]);
+        git(&root, &["branch", "-M", "main"]);
+        git(&root, &["push", "-qu", "origin", "main"]);
+        r
     }
 
-    pub fn calls(&self, name: &str) -> Vec<Vec<String>> {
-        let Ok(content) = fs::read_to_string(self.logdir.join(format!("{name}.log"))) else {
-            return vec![];
-        };
-        content
-            .lines()
-            .map(|line| {
-                line.strip_suffix('\t')
-                    .unwrap_or(line)
-                    .split('\t')
-                    .map(String::from)
-                    .collect()
-            })
-            .collect()
+    pub fn root(&self) -> PathBuf {
+        self.tmp.path().join("tasks")
     }
 
-    /// The line a recording stub logs for this call.
-    pub fn call(&self, project: Option<&str>, args: &[&str]) -> Vec<String> {
-        let mut v = vec![
-            project
-                .map(|p| format!("TASK_PROJECT={p}"))
-                .unwrap_or_default(),
-        ];
-        v.extend(args.iter().map(|a| a.to_string()));
-        v
+    /// A task file, committed and pushed.
+    pub fn seed(&self, project: &str, status: &str, file: &str, body: &str) {
+        fs::write(self.root().join(project).join(status).join(file), body).unwrap();
+        git(&self.root(), &["add", "-A"]);
+        git(&self.root(), &["commit", "-qm", &format!("seed {file}")]);
+        git(&self.root(), &["push", "-q"]);
     }
 
-    /// An engine finding these stubs and the base system only: an unstubbed
-    /// script fails rather than reaching an installed one and the real tasks
-    /// repo.
-    pub fn engine(&self) -> Engine {
-        Engine::with_path(format!("{}:/usr/bin:/bin", self.dir.display()))
+    pub fn at(&self, project: &str, status: &str, file: &str) -> bool {
+        self.root().join(project).join(status).join(file).is_file()
+    }
+
+    pub fn subject(&self) -> String {
+        git(&self.root(), &["log", "-1", "--format=%s"])
+    }
+
+    pub fn pushed(&self) -> bool {
+        git(&self.root(), &["rev-parse", "HEAD"])
+            == git(&self.root(), &["rev-parse", "origin/main"])
     }
 }
 
-/// The primary's listing in the app fixtures: an open queue, a blank line,
-/// the done tail.
+/// What the app fixture's primary lists: an open queue, a blank line, the
+/// done tail.
 pub const PROJ: &str = "\
 ACTIVE (1)
   H010 busy
@@ -152,19 +159,33 @@ TODO (2)
   N007 left-pad
   N008 right-pad";
 
-/// An app over the fixture listings: `proj`, and `widget` beside it when
-/// `second`. The tasks root does not exist; tests needing files make one.
-pub fn app(second: bool) -> App {
+/// Put a task file in the fixture's tasks root.
+pub fn put(root: &Path, project: &str, status: &str, file: &str, body: &str) {
+    let dir = root.join(project).join(status);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(file), body).unwrap();
+}
+
+/// An app over task files listing as PROJ, and as WIDGET beside it when
+/// `second`. The files go away with the returned dir.
+pub fn app(second: bool) -> (App, TempDir) {
+    let tmp = TempDir::new();
+    for (project, status, file, body) in [
+        ("proj", "active", "H010-busy.md", "# Busy\n\nbody\n"),
+        ("proj", "todo", "N001-alpha.md", "# Alpha\n\nfirst line\n"),
+        ("proj", "todo", "N002-beta.md", ""),
+        ("proj", "todo", "N003-gamma.md", "# Gamma\n"),
+        ("proj", "done", "N050-shipped.md", "# Shipped\n"),
+        ("widget", "todo", "N007-left-pad.md", "# Pad\n"),
+        ("widget", "todo", "N008-right-pad.md", "# Right\n"),
+    ] {
+        put(tmp.path(), project, status, file, body);
+    }
     let cfg = Config {
         primary: "proj".into(),
         second: second.then(|| "widget".into()),
-        tasks_root: PathBuf::from("/nonexistent"),
-        opts: ListOpts {
-            recent: 7,
-            dates: false,
-            labs: false,
-            stale: false,
-        },
+        tasks_root: tmp.path().to_path_buf(),
+        opts: ListOpts::default(),
         editor: Some("micro".into()),
     };
     let mut a = App::new(cfg, Instant::now());
@@ -173,14 +194,43 @@ pub fn app(second: bool) -> App {
         month: 11,
         day: 16,
     };
-    a.set_listings(if second {
-        vec![PROJ.into(), WIDGET.into()]
-    } else {
-        vec![PROJ.into()]
-    });
-    a
+    a.relist();
+    (a, tmp)
 }
 
 pub fn key(a: &mut App, code: KeyCode) -> Vec<Effect> {
     a.on_key(KeyEvent::from(code), Instant::now())
+}
+
+/// One frame of the app, `w` by `h`.
+pub fn draw(a: &mut App, w: u16, h: u16) -> Terminal<TestBackend> {
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| {
+        if let Some(pos) = ui::render(f.area(), f.buffer_mut(), a) {
+            f.set_cursor_position(pos);
+        }
+    })
+    .unwrap();
+    t
+}
+
+/// The frame's rows as text, trailing blanks trimmed.
+pub fn lines(t: &Terminal<TestBackend>) -> Vec<String> {
+    let buf = t.backend().buffer();
+    (0..buf.area.height)
+        .map(|y| {
+            let mut s = String::new();
+            let mut hidden = 0;
+            for x in 0..buf.area.width {
+                if hidden > 0 {
+                    hidden -= 1;
+                    continue;
+                }
+                let sym = buf[(x, y)].symbol();
+                s.push_str(sym);
+                hidden = sym.cell_width().saturating_sub(1);
+            }
+            s.trim_end().to_string()
+        })
+        .collect()
 }

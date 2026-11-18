@@ -1,8 +1,12 @@
-//! The rows of `task-list.sh`'s human output, and the task each one names.
-//!
-//! That format is a contract: a `LABEL (count)` header sets the status of the
-//! rows below it, and a task row is two spaces, `<Letter><NNN>`, a space, the
-//! slug, then optionally ` [worker]` and ` (DD-MM)`. Anything else is text.
+//! What a project holds, row by row: the listing `taskania list` prints and the
+//! dashboard draws. A `LABEL (count)` header per status, then a row per task:
+//! two spaces, `<Letter><NNN>`, a space, the slug, then optionally ` (DD-MM)`.
+
+use std::fs;
+use std::path::Path;
+use std::time::{Duration, SystemTime};
+
+use crate::clock::Date;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Status {
@@ -13,6 +17,17 @@ pub enum Status {
     Stale,
     Done,
     Canceled,
+}
+
+/// Why a manual move is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Into planning or active: those are claims.
+    Claim,
+    /// Already there.
+    Same,
+    /// Into stale from anywhere but active.
+    NotActive,
 }
 
 impl Status {
@@ -26,7 +41,16 @@ impl Status {
         Status::Canceled,
     ];
 
-    /// The directory under a project, which is also the name the scripts take.
+    /// What `list` shows by default, in its order.
+    pub const OPEN: [Status; 5] = [
+        Status::Active,
+        Status::Planned,
+        Status::Planning,
+        Status::Stale,
+        Status::Todo,
+    ];
+
+    /// The directory under a project, which is also the status's name.
     pub fn dir(self) -> &'static str {
         match self {
             Status::Todo => "todo",
@@ -39,25 +63,25 @@ impl Status {
         }
     }
 
-    fn from_label(label: &str) -> Option<Status> {
-        Status::ALL.into_iter().find(|s| {
-            s.dir().eq_ignore_ascii_case(label) && label.bytes().all(|b| b.is_ascii_uppercase())
-        })
+    pub fn from_dir(name: &str) -> Option<Status> {
+        Status::ALL.into_iter().find(|s| s.dir() == name)
     }
 
-    /// Whether `task-move.sh` takes a task from here to `to`: into todo,
-    /// planned, done or canceled from anywhere else, into stale only from active,
-    /// never into planning or active (those are claims).
+    /// The manual move rule; `None` when the move is allowed.
+    pub fn move_refusal(self, to: Status) -> Option<Refusal> {
+        match to {
+            Status::Planning | Status::Active => Some(Refusal::Claim),
+            _ if self == to => Some(Refusal::Same),
+            Status::Stale if self != Status::Active => Some(Refusal::NotActive),
+            _ => None,
+        }
+    }
+
     pub fn can_move_to(self, to: Status) -> bool {
-        self != to
-            && match to {
-                Status::Todo | Status::Planned | Status::Done | Status::Canceled => true,
-                Status::Stale => self == Status::Active,
-                Status::Planning | Status::Active => false,
-            }
+        self.move_refusal(to).is_none()
     }
 
-    /// Done and canceled: the statuses `task-reprioritize.sh` does not look in.
+    /// Done and canceled: the statuses a reprioritize does not look in.
     pub fn is_closed(self) -> bool {
         matches!(self, Status::Done | Status::Canceled)
     }
@@ -75,10 +99,8 @@ pub struct TaskKey {
 impl TaskKey {
     /// From a task filename, `<Letter><NNN>-<slug>[.md]`.
     pub fn from_filename(name: &str) -> Option<TaskKey> {
-        let name = name.strip_suffix(".md").unwrap_or(name);
-        let (head, slug) = name.split_once('-')?;
-        let (_, id) = split_name(head)?;
-        (!slug.is_empty()).then(|| TaskKey {
+        let (_, id, slug) = split_filename(name)?;
+        Some(TaskKey {
             id: id.to_string(),
             slug: slug.to_string(),
         })
@@ -94,6 +116,16 @@ pub struct Task {
 }
 
 impl Task {
+    pub fn from_filename(status: Status, name: &str) -> Option<Task> {
+        let (letter, id, slug) = split_filename(name)?;
+        Some(Task {
+            status,
+            letter,
+            id: id.to_string(),
+            slug: slug.to_string(),
+        })
+    }
+
     pub fn filename(&self) -> String {
         format!("{}{}-{}.md", self.letter, self.id, self.slug)
     }
@@ -111,150 +143,393 @@ impl Task {
     }
 }
 
+/// `<Letter><NNN>-<slug>[.md]` into its letter, id and slug.
+fn split_filename(name: &str) -> Option<(char, &str, &str)> {
+    let name = name.strip_suffix(".md").unwrap_or(name);
+    let (head, slug) = name.split_once('-')?;
+    let mut chars = head.chars();
+    let letter = chars.next().filter(char::is_ascii_uppercase)?;
+    let id = chars.as_str();
+    let id_ok = id.len() == 3 && id.bytes().all(|b| b.is_ascii_digit());
+    (id_ok && !slug.is_empty()).then_some((letter, id, slug))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     pub text: String,
     pub task: Option<Task>,
 }
 
-/// Split `task-list.sh` output into rows: trailing newlines dropped, every
-/// other line kept, blank ones included.
-pub fn parse(output: &str) -> Vec<Row> {
-    let mut status = None;
-    output
-        .trim_end_matches('\n')
-        .split('\n')
-        .map(|line| {
-            if let Some(s) = header(line) {
-                status = Some(s);
+impl Row {
+    fn text(text: impl Into<String>) -> Row {
+        Row {
+            text: text.into(),
+            task: None,
+        }
+    }
+}
+
+/// What to list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spec {
+    /// The sections, in order.
+    pub statuses: Vec<Status>,
+    /// Append done then canceled from the last this many days, each if any,
+    /// unless already a section.
+    pub recent: Option<u32>,
+    /// Tag each row with its file's day-month mtime.
+    pub dates: bool,
+    /// Print each task's file, indented, under its row.
+    pub verbose: bool,
+    /// Bare filenames without `.md`, one per line, no headers.
+    pub ids: bool,
+}
+
+impl Spec {
+    /// The open statuses, stale only when asked for.
+    pub fn open(stale: bool) -> Vec<Status> {
+        Status::OPEN
+            .into_iter()
+            .filter(|&s| stale || s != Status::Stale)
+            .collect()
+    }
+}
+
+/// The rows of a project's listing, `(none)` when it shows no task. The
+/// project directory must exist.
+pub fn rows(project_dir: &Path, spec: &Spec) -> Result<Vec<Row>, String> {
+    if !project_dir.is_dir() {
+        return Err(format!(
+            "error: tasks dir not found: {}",
+            project_dir.display()
+        ));
+    }
+    let mut out = Vec::new();
+    let mut shown = 0;
+    for &status in &spec.statuses {
+        shown += section(&mut out, project_dir, status, None, spec);
+    }
+    if let Some(days) = spec.recent
+        && !spec.ids
+    {
+        let window = Duration::from_secs(u64::from(days) * 86_400);
+        let tail: Vec<Status> = [Status::Done, Status::Canceled]
+            .into_iter()
+            .filter(|s| !spec.statuses.contains(s))
+            .filter(|&s| !files(project_dir, s, Some(window)).is_empty())
+            .collect();
+        if !tail.is_empty() {
+            out.push(Row::text(""));
+            for status in tail {
+                shown += section(&mut out, project_dir, status, Some(window), spec);
             }
-            let task = status.and_then(|s| task_row(line, s));
-            Row {
-                text: line.to_string(),
-                task,
-            }
+        }
+    }
+    if shown == 0 && !spec.ids {
+        out.push(Row::text("(none)"));
+    }
+    Ok(out)
+}
+
+/// One status's rows, nothing when it holds no task. Returns the task count.
+fn section(
+    out: &mut Vec<Row>,
+    project_dir: &Path,
+    status: Status,
+    window: Option<Duration>,
+    spec: &Spec,
+) -> usize {
+    let files = files(project_dir, status, window);
+    if files.is_empty() {
+        return 0;
+    }
+    if spec.ids {
+        out.extend(files.iter().map(|f| Row::text(stem(&f.name))));
+        return files.len();
+    }
+    out.push(Row::text(format!(
+        "{} ({})",
+        status.dir().to_ascii_uppercase(),
+        files.len()
+    )));
+    for f in &files {
+        // A space after the id sets it off from the slug, whose own hyphens stay.
+        let mut text = format!("  {}", stem(&f.name).replacen('-', " ", 1));
+        if spec.dates {
+            text.push_str(&format!(" ({})", Date::of(f.mtime).dd_mm()));
+        }
+        out.push(Row {
+            text,
+            task: Task::from_filename(status, &f.name),
+        });
+        if spec.verbose {
+            out.push(Row::text(""));
+            let body = fs::read_to_string(project_dir.join(status.dir()).join(&f.name))
+                .unwrap_or_default();
+            out.extend(body.lines().map(|l| Row::text(format!("    {l}"))));
+            out.push(Row::text(""));
+        }
+    }
+    files.len()
+}
+
+fn stem(name: &str) -> &str {
+    name.strip_suffix(".md").unwrap_or(name)
+}
+
+struct File {
+    name: String,
+    mtime: SystemTime,
+}
+
+/// A status's `*.md` files, those touched within `window` when given. Done
+/// and canceled sort by priority letter, then newest first: a finished task's
+/// id says nothing about when it finished. The rest sort by name.
+fn files(project_dir: &Path, status: Status, window: Option<Duration>) -> Vec<File> {
+    let Ok(entries) = fs::read_dir(project_dir.join(status.dir())) else {
+        return vec![];
+    };
+    let now = SystemTime::now();
+    let mut files: Vec<File> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let meta = fs::metadata(e.path()).ok()?;
+            (name.ends_with(".md") && meta.is_file()).then(|| File {
+                name,
+                mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            })
         })
-        .collect()
-}
-
-/// `TODO (3)` and its kin.
-fn header(line: &str) -> Option<Status> {
-    let (label, rest) = line.split_once(" (")?;
-    let count = rest.strip_suffix(')')?;
-    if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+        .filter(|f| match (window, now.duration_since(f.mtime)) {
+            (None, _) | (Some(_), Err(_)) => true,
+            (Some(w), Ok(age)) => age < w,
+        })
+        .collect();
+    if status.is_closed() {
+        files.sort_by(|a, b| {
+            let letter = |f: &File| f.name.chars().next();
+            letter(a)
+                .cmp(&letter(b))
+                .then(b.mtime.cmp(&a.mtime))
+                .then(a.name.cmp(&b.name))
+        });
+    } else {
+        files.sort_by(|a, b| a.name.cmp(&b.name));
     }
-    Status::from_label(label)
-}
-
-fn task_row(line: &str, status: Status) -> Option<Task> {
-    let rest = line.strip_prefix("  ")?;
-    let (head, rest) = rest.split_once(' ')?;
-    let (letter, id) = split_name(head)?;
-    let slug = rest.split(' ').next().unwrap_or("");
-    if slug.is_empty() {
-        return None;
-    }
-    Some(Task {
-        status,
-        letter,
-        id: id.to_string(),
-        slug: slug.to_string(),
-    })
-}
-
-/// `N001` into its letter and three-digit id.
-fn split_name(head: &str) -> Option<(char, &str)> {
-    let mut chars = head.chars();
-    let letter = chars.next().filter(char::is_ascii_uppercase)?;
-    let id = chars.as_str();
-    (id.len() == 3 && id.bytes().all(|b| b.is_ascii_digit())).then_some((letter, id))
+    files
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempDir;
+    use std::fs::File as FsFile;
 
-    const LISTING: &str = "\
-ACTIVE (1)
-  H010 busy [hlab-7] (16-11)
-TODO (2)
-  N001 fix-the-thing
-  U012 update-readme (03-11)
+    fn put(root: &Path, status: &str, name: &str, body: &str, days_ago: u64) {
+        let dir = root.join(status);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(name), body).unwrap();
+        let t = SystemTime::now() - Duration::from_secs(days_ago * 86_400);
+        FsFile::options()
+            .write(true)
+            .open(dir.join(name))
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
 
-DONE (1)
-  N050 shipped
-";
+    /// A task in every open status, done and canceled ones of different ages.
+    fn proj() -> TempDir {
+        let tmp = TempDir::new();
+        let p = tmp.path();
+        put(p, "todo", "H003-fix-sensor-bug.md", "# Sensor\n", 0);
+        put(p, "todo", "U012-update-readme.md", "# Readme\n", 0);
+        put(p, "planned", "N007-refactor-api.md", "# Api\n", 0);
+        put(
+            p,
+            "active",
+            "H001-being-done.md",
+            "# Being\n\nWorker: hlab-9\n",
+            0,
+        );
+        put(p, "stale", "H002-paused.md", "# Paused\n", 0);
+        put(p, "done", "N020-recent-done.md", "# Shipped\n", 2);
+        put(p, "done", "N021-old-done.md", "# Old\n", 30);
+        put(p, "canceled", "N022-recent-cancel.md", "# Dropped\n", 1);
+        tmp
+    }
 
-    #[test]
-    fn rows_keep_every_line_but_the_trailing_newline() {
-        let rows = parse(LISTING);
-        assert_eq!(rows.len(), 8);
-        assert_eq!(rows[5].text, "");
-        assert_eq!(parse("(none)\n").len(), 1);
+    fn spec(statuses: &[Status]) -> Spec {
+        Spec {
+            statuses: statuses.to_vec(),
+            recent: None,
+            dates: false,
+            verbose: false,
+            ids: false,
+        }
+    }
+
+    fn text(dir: &Path, spec: &Spec) -> String {
+        rows(dir, spec)
+            .unwrap()
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn a_header_sets_the_status_of_the_rows_below() {
-        let rows = parse(LISTING);
-        let tasks: Vec<_> = rows.iter().filter_map(|r| r.task.as_ref()).collect();
-        let got: Vec<_> = tasks.iter().map(|t| (t.status, t.filename())).collect();
+    fn the_default_view_is_the_open_queue_stale_above_todo() {
+        let t = proj();
         assert_eq!(
-            got,
-            vec![
-                (Status::Active, "H010-busy.md".to_string()),
-                (Status::Todo, "N001-fix-the-thing.md".to_string()),
-                (Status::Todo, "U012-update-readme.md".to_string()),
-                (Status::Done, "N050-shipped.md".to_string()),
-            ]
+            text(t.path(), &spec(&Spec::open(true))),
+            "ACTIVE (1)\n  H001 being-done\nPLANNED (1)\n  N007 refactor-api\n\
+             STALE (1)\n  H002 paused\nTODO (2)\n  H003 fix-sensor-bug\n  U012 update-readme"
+        );
+        assert_eq!(
+            text(t.path(), &spec(&Spec::open(false))),
+            "ACTIVE (1)\n  H001 being-done\nPLANNED (1)\n  N007 refactor-api\n\
+             TODO (2)\n  H003 fix-sensor-bug\n  U012 update-readme"
         );
     }
 
     #[test]
-    fn worker_and_date_tags_are_not_part_of_the_slug() {
-        let rows = parse(LISTING);
-        let busy = rows[1].task.as_ref().unwrap();
-        assert_eq!(busy.slug, "busy");
-        assert_eq!(busy.name(), "H010");
+    fn a_row_names_its_task_and_nothing_else_does() {
+        let t = proj();
+        let rows = rows(t.path(), &spec(&[Status::Todo])).unwrap();
+        assert_eq!(rows[0].task, None);
+        let task = rows[1].task.as_ref().unwrap();
+        assert_eq!(
+            (task.status, task.filename()),
+            (Status::Todo, "H003-fix-sensor-bug.md".to_string())
+        );
     }
 
     #[test]
-    fn other_lines_are_not_task_rows() {
-        for line in [
-            "(none)",
-            "",
-            "error: tasks dir not found: /x",
-            "TODO (2)",
-            "   N001 indented-too-far",
-            "  N01 short-id",
-            "  n001 lowercase",
-            "  N001",
-        ] {
-            let rows = parse(&format!("TODO (1)\n{line}\n(end)"));
-            assert_eq!(rows[1].task, None, "{line:?}");
-        }
+    fn ids_are_bare_filenames_by_priority_without_headers() {
+        let t = proj();
+        let ids = Spec {
+            ids: true,
+            recent: Some(7),
+            ..spec(&[Status::Todo, Status::Planned])
+        };
+        assert_eq!(
+            text(t.path(), &ids),
+            "H003-fix-sensor-bug\nU012-update-readme\nN007-refactor-api"
+        );
+        let empty = TempDir::new();
+        assert_eq!(rows(empty.path(), &ids).unwrap(), vec![]);
     }
 
     #[test]
-    fn rows_before_any_header_are_not_tasks() {
-        assert_eq!(parse("  N001 orphan")[0].task, None);
+    fn dates_tag_each_row_with_its_mtime() {
+        let t = proj();
+        let dated = Spec {
+            dates: true,
+            ..spec(&[Status::Active])
+        };
+        let mtime = fs::metadata(t.path().join("active/H001-being-done.md"))
+            .and_then(|m| m.modified())
+            .unwrap();
+        let day = Date::of(mtime).dd_mm();
+        assert_eq!(
+            text(t.path(), &dated),
+            format!("ACTIVE (1)\n  H001 being-done ({day})")
+        );
     }
 
     #[test]
-    fn a_header_needs_a_known_uppercase_label_and_a_count() {
-        assert_eq!(header("TODO (3)"), Some(Status::Todo));
-        assert_eq!(header("CANCELED (12)"), Some(Status::Canceled));
-        assert_eq!(header("todo (3)"), None);
-        assert_eq!(header("TODO (x)"), None);
-        assert_eq!(header("TODO ()"), None);
-        assert_eq!(header("BOGUS (1)"), None);
+    fn verbose_prints_the_file_indented_under_its_row() {
+        let t = proj();
+        let verbose = Spec {
+            verbose: true,
+            ..spec(&[Status::Active])
+        };
+        assert_eq!(
+            text(t.path(), &verbose),
+            "ACTIVE (1)\n  H001 being-done\n\n    # Being\n    \n    Worker: hlab-9\n"
+        );
+    }
+
+    #[test]
+    fn recent_appends_done_then_canceled_within_the_window() {
+        let t = proj();
+        let recent = Spec {
+            recent: Some(7),
+            ..spec(&Spec::open(true))
+        };
+        let got = text(t.path(), &recent);
+        assert!(
+            got.ends_with(
+                "  U012 update-readme\n\nDONE (1)\n  N020 recent-done\nCANCELED (1)\n  N022 recent-cancel"
+            ),
+            "{got}"
+        );
+        let wide = Spec {
+            recent: Some(100),
+            ..spec(&[Status::Todo])
+        };
+        assert!(text(t.path(), &wide).contains("DONE (2)\n  N020 recent-done\n  N021 old-done"));
+    }
+
+    #[test]
+    fn recent_skips_an_empty_window_and_a_status_already_listed() {
+        let t = proj();
+        put(t.path(), "canceled", "N023-old-cancel.md", "", 40);
+        fs::remove_file(t.path().join("canceled/N022-recent-cancel.md")).unwrap();
+        let recent = Spec {
+            recent: Some(7),
+            ..spec(&[Status::Todo])
+        };
+        assert!(!text(t.path(), &recent).contains("CANCELED"));
+        let all = Spec {
+            recent: Some(7),
+            ..spec(&[Status::Done])
+        };
+        assert_eq!(
+            text(t.path(), &all),
+            "DONE (2)\n  N020 recent-done\n  N021 old-done",
+            "one unwindowed section, no tail"
+        );
+    }
+
+    #[test]
+    fn done_sorts_by_letter_then_newest_first() {
+        let t = TempDir::new();
+        put(t.path(), "done", "A010-alpha.md", "", 10);
+        put(t.path(), "done", "H061-newer.md", "", 1);
+        put(t.path(), "done", "H060-older.md", "", 5);
+        assert_eq!(
+            text(t.path(), &spec(&[Status::Done])),
+            "DONE (3)\n  A010 alpha\n  H061 newer\n  H060 older"
+        );
+    }
+
+    #[test]
+    fn nothing_to_show_is_none_and_a_missing_project_an_error() {
+        let t = TempDir::new();
+        fs::create_dir_all(t.path().join("todo")).unwrap();
+        assert_eq!(text(t.path(), &spec(&Spec::open(true))), "(none)");
+        let gone = t.path().join("nope");
+        assert_eq!(
+            rows(&gone, &spec(&[Status::Todo])),
+            Err(format!("error: tasks dir not found: {}", gone.display()))
+        );
+    }
+
+    #[test]
+    fn other_files_list_as_text() {
+        let t = TempDir::new();
+        put(t.path(), "todo", "notes.md", "", 0);
+        put(t.path(), "todo", "N001-a.txt", "", 0);
+        let rows = rows(t.path(), &spec(&[Status::Todo])).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[1].text.as_str(), &rows[1].task), ("  notes", &None));
     }
 
     #[test]
     fn moves_follow_the_manual_move_rule() {
         use Status::*;
-        // Every pair, as task-move.sh decides it: todo, planned, done and
-        // canceled from any other status, stale only from active.
         for from in Status::ALL {
             for to in Status::ALL {
                 let legal = from != to
@@ -266,6 +541,9 @@ DONE (1)
                 assert_eq!(from.can_move_to(to), legal, "{from:?} -> {to:?}");
             }
         }
+        assert_eq!(Active.move_refusal(Active), Some(Refusal::Claim));
+        assert_eq!(Todo.move_refusal(Todo), Some(Refusal::Same));
+        assert_eq!(Todo.move_refusal(Stale), Some(Refusal::NotActive));
     }
 
     #[test]
@@ -282,7 +560,14 @@ DONE (1)
                 slug: "x".into()
             })
         );
-        assert_eq!(TaskKey::from_filename("notes.md"), None);
-        assert_eq!(TaskKey::from_filename("N050-.md"), None);
+        for bad in [
+            "notes.md",
+            "N050-.md",
+            "n050-x.md",
+            "N05-x.md",
+            "N0500-x.md",
+        ] {
+            assert_eq!(TaskKey::from_filename(bad), None, "{bad}");
+        }
     }
 }

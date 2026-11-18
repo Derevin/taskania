@@ -1,169 +1,163 @@
-//! Taskania, the task dashboard: the live view of one or two projects' task
-//! queues, with a cursor to peek, edit, create, move and reprioritize tasks.
-//! It owns no task logic; every change is a task script's, called through
-//! `engine`.
+//! Taskania, the task tool: verbs that list and change tasks, and a dashboard
+//! (`--watch`) showing one or two projects' queues live, with a cursor to peek,
+//! edit, create, move and reprioritize tasks.
 
 mod app;
 mod args;
+mod cli;
 mod clock;
 mod engine;
+mod git;
 mod listing;
+mod project;
+mod tasks;
 #[cfg(test)]
 mod testutil;
 mod ui;
 mod watch;
 
 use std::collections::VecDeque;
-use std::io::{self, IsTerminal};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
-use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{self, Event};
 use ratatui::crossterm::{execute, terminal};
 use ratatui::layout::Rect;
 
-use app::{App, Config, Effect, Job};
-use args::{Args, Parsed};
+use app::{App, Config, Effect, Job, ListOpts};
+use args::Parsed;
 use clock::Date;
-use engine::{Engine, ListOpts};
+use engine::Engine;
+use tasks::Tasks;
+
+/// How often the dashboard checks for changed task files.
+const POLL: Duration = Duration::from_secs(2);
+
+/// Where Taskania looks: the tasks root, the cwd a project is resolved from,
+/// and the conf mapping checkout names to projects.
+pub struct Ctx {
+    pub root: PathBuf,
+    pub cwd: PathBuf,
+    pub projects_conf: PathBuf,
+}
+
+impl Ctx {
+    fn from_env() -> Ctx {
+        let root = env_nonempty("TASKS_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env_nonempty("HOME").unwrap_or_default()).join("repos/tasks")
+            });
+        let projects_conf = env_nonempty("TASKANIA_PROJECTS_CONF")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("projects.conf"));
+        Ctx {
+            root,
+            cwd: logical_cwd(),
+            projects_conf,
+        }
+    }
+
+    pub fn cwd_project(&self) -> Result<String, String> {
+        project::resolve(&self.cwd, &self.projects_conf)
+    }
+
+    pub fn tasks(&self) -> Tasks {
+        Tasks::new(self.root.clone())
+    }
+}
 
 fn main() -> ExitCode {
-    let args = match args::parse(std::env::args().skip(1)) {
-        Ok(Parsed::Help) => {
-            println!("{}", args::HELP);
-            return ExitCode::SUCCESS;
-        }
-        Ok(Parsed::Run(args)) => args,
+    let parsed = match args::parse(std::env::args().skip(1)) {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("taskania: {e}");
             return ExitCode::FAILURE;
         }
     };
-    match start(args) {
-        Ok(()) => ExitCode::SUCCESS,
+    let ctx = Ctx::from_env();
+    let result = match parsed {
+        Parsed::Help(text) => Ok(format!("{text}\n")),
+        Parsed::Run { project, verb } => cli::run(&ctx, project, verb),
+        Parsed::Watch { with } => dashboard(&ctx, with).map(|()| String::new()),
+    };
+    match result {
+        Ok(out) => {
+            // A reader that stopped early (`| head`) is no failure.
+            let _ = io::stdout().write_all(out.as_bytes());
+            ExitCode::SUCCESS
+        }
         Err(e) => {
-            eprintln!("taskania: {e}");
+            eprintln!("{e}");
             ExitCode::FAILURE
         }
     }
-}
-
-fn start(args: Args) -> Result<(), String> {
-    let engine = Engine::new();
-    if engine.which("task-list.sh").is_none() {
-        return Err(
-            "task-list.sh is not on PATH; Taskania needs the task scripts \
-             (scripts/ in github.com/Derevin/dotfiles-public)"
-                .into(),
-        );
-    }
-    let tasks_root = env_nonempty("TASKS_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env_nonempty("HOME").unwrap_or_default()).join("repos/tasks")
-        });
-    let primary = match args.project {
-        Some(p) => p,
-        None => engine.find_project()?,
-    };
-    check_dir(&tasks_root, &primary)?;
-    // Naming the primary again collapses to one column, so a caller can pass
-    // --with unconditionally.
-    let second = args.with.filter(|w| *w != primary);
-    if let Some(w) = &second {
-        check_dir(&tasks_root, w)?;
-    }
-    let editor = env_nonempty("VISUAL").or_else(|| env_nonempty("EDITOR"));
-    let opts = ListOpts {
-        recent: args.recent,
-        dates: args.dates,
-        labs: args.labs,
-        stale: args.stale,
-    };
-    let mut app = App::new(
-        Config {
-            primary,
-            second,
-            tasks_root,
-            opts,
-            editor,
-        },
-        Instant::now(),
-    );
-    relist(&mut app, &engine);
-
-    if args.once {
-        let (width, height) = once_size();
-        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
-        ui::render(buf.area, &mut buf, &mut app);
-        print!("{}", ui::frame_text(&buf));
-        return Ok(());
-    }
-    if !io::stdout().is_terminal() {
-        return Err("stdout is not a terminal (--once prints a single frame)".into());
-    }
-    let terminal = ratatui::try_init().map_err(|e| {
-        ratatui::restore();
-        format!("cannot take over the terminal: {e}")
-    })?;
-    let result = live(terminal, app, engine, Duration::from_secs(args.poll));
-    ratatui::restore();
-    result.map_err(|e| e.to_string())
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-fn check_dir(root: &Path, project: &str) -> Result<(), String> {
-    let dir = root.join(project);
-    if dir.is_dir() {
-        Ok(())
-    } else {
-        Err(format!("tasks dir not found: {}", dir.display()))
+/// The cwd as the shell spells it, symlinks kept, when `PWD` still names it.
+fn logical_cwd() -> PathBuf {
+    let real = std::env::current_dir().unwrap_or_default();
+    match env_nonempty("PWD").map(PathBuf::from) {
+        Some(pwd)
+            if pwd.is_absolute() && fs::canonicalize(&pwd).ok() == fs::canonicalize(&real).ok() =>
+        {
+            pwd
+        }
+        _ => real,
     }
 }
 
-/// The frame size for --once: the tty's when stdin is one, else LINES and
-/// COLUMNS, else 24x80.
-fn once_size() -> (u16, u16) {
-    if io::stdin().is_terminal()
-        && let Ok((w, h)) = terminal::size()
-        && w > 0
-        && h > 0
-    {
-        return (w, h);
+fn dashboard(ctx: &Ctx, with: Option<String>) -> Result<(), String> {
+    let app = open(ctx, with)?;
+    if !io::stdout().is_terminal() {
+        return Err("error: stdout is not a terminal".into());
     }
-    let var = |name: &str, default: u16| {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n: &u16| n > 0)
-            .unwrap_or(default)
-    };
-    (var("COLUMNS", 80), var("LINES", 24))
+    let terminal = ratatui::try_init().map_err(|e| {
+        ratatui::restore();
+        format!("error: cannot take over the terminal: {e}")
+    })?;
+    let result = live(terminal, app, Engine::new(ctx.tasks()));
+    ratatui::restore();
+    result.map_err(|e| format!("error: {e}"))
 }
 
-fn relist(app: &mut App, engine: &Engine) {
-    let outputs = app
-        .columns
-        .iter()
-        .map(|c| engine.list(&c.project, &app.opts))
-        .collect();
-    app.set_listings(outputs);
+/// The dashboard over the cwd's project, `with` beside it.
+fn open(ctx: &Ctx, with: Option<String>) -> Result<App, String> {
+    let tasks = ctx.tasks();
+    let primary = ctx.cwd_project()?;
+    tasks.project_dir(&primary)?;
+    // Naming the primary again collapses to one column, so a caller can pass
+    // --with unconditionally.
+    let second = with.filter(|w| *w != primary);
+    if let Some(w) = &second {
+        tasks.project_dir(w)?;
+    }
+    let editor = env_nonempty("VISUAL").or_else(|| env_nonempty("EDITOR"));
+    let mut app = App::new(
+        Config {
+            primary,
+            second,
+            tasks_root: ctx.root.clone(),
+            opts: ListOpts::default(),
+            editor,
+        },
+        Instant::now(),
+    );
+    app.relist();
+    Ok(app)
 }
 
-fn live(
-    mut terminal: DefaultTerminal,
-    mut app: App,
-    engine: Engine,
-    poll: Duration,
-) -> io::Result<()> {
+fn live(mut terminal: DefaultTerminal, mut app: App, engine: Engine) -> io::Result<()> {
     // Changes run off the UI thread, one at a time, in the order they were made.
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (done_tx, done_rx) = mpsc::channel();
@@ -177,11 +171,11 @@ fn live(
         }
     });
 
-    let result = run_loop(&mut terminal, &mut app, &engine, poll, &job_tx, &done_rx);
+    let result = run_loop(&mut terminal, &mut app, &engine, &job_tx, &done_rx);
 
-    // A change already queued finishes, also when the loop failed: a script
-    // cut off between its commit and its push would leave the tasks repo out
-    // of step with its remote.
+    // A change already queued finishes, also when the loop failed: one cut off
+    // between its commit and its push would leave the tasks repo out of step
+    // with its remote.
     drop(job_tx);
     if app.in_flight > 0 {
         ratatui::restore();
@@ -195,13 +189,12 @@ fn run_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     engine: &Engine,
-    poll: Duration,
     job_tx: &mpsc::Sender<Job>,
     done_rx: &mpsc::Receiver<(Job, Result<String, String>)>,
 ) -> io::Result<()> {
     let dirs = app.project_dirs();
     let mut sig = watch::signature(&dirs);
-    let mut next_poll = Instant::now() + poll;
+    let mut next_poll = Instant::now() + POLL;
     loop {
         app.today = Date::today();
         terminal.draw(|f| {
@@ -250,7 +243,7 @@ fn run_loop(
         let now = Instant::now();
         app.tick(now);
         if now >= next_poll {
-            next_poll = now + poll;
+            next_poll = now + POLL;
             changed |= watch::signature(&dirs) != sig;
             app.refresh_peek();
         }
@@ -258,7 +251,7 @@ fn run_loop(
             // Signature first: a change landing during the listing shows up
             // as a difference at the next poll rather than being missed.
             sig = watch::signature(&dirs);
-            relist(app, engine);
+            app.relist();
         }
     }
 }
@@ -276,4 +269,78 @@ fn suspended<T>(terminal: &mut DefaultTerminal, f: impl FnOnce() -> T) -> io::Re
     let size = terminal.size()?;
     terminal.resize(Rect::new(0, 0, size.width, size.height))?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{TempDir, draw, git, lines, put};
+
+    /// A tasks root holding `proj` and `widget`, and a checkout of `proj`.
+    fn ctx(tmp: &TempDir) -> Ctx {
+        let root = tmp.path().join("tasks");
+        put(&root, "proj", "todo", "H003-fix-sensor-bug.md", "");
+        put(&root, "proj", "todo", "N004-tidy.md", "");
+        put(&root, "widget", "todo", "N001-tweak-conf.md", "");
+        let cwd = tmp.path().join("Proj-hlab-012-x");
+        fs::create_dir_all(&cwd).unwrap();
+        git(&cwd, &["init", "-q"]);
+        Ctx {
+            projects_conf: root.join("projects.conf"),
+            root,
+            cwd,
+        }
+    }
+
+    #[test]
+    fn the_dashboard_opens_on_the_cwds_project_with_the_second_beside_it() {
+        let tmp = TempDir::new();
+        let mut app = open(&ctx(&tmp), Some("widget".into())).unwrap();
+        app.today = Date {
+            year: 2026,
+            month: 11,
+            day: 16,
+        };
+        let got = lines(&draw(&mut app, 60, 8));
+        // The second column is its longest line wide, flush with the 60th cell.
+        assert_eq!(got[0], format!("{:<43}{}", "TODO (2)", "TODO (1)"));
+        assert_eq!(
+            got[1],
+            format!("{:<43}{}", "  H003 fix-sensor-bug", "  N001 tweak-conf")
+        );
+        assert_eq!(got[2], "  N004 tidy");
+        assert!(got[3..7].iter().all(String::is_empty));
+        assert!(
+            got[7].starts_with("proj, done between Mo 09-11 and 16-11")
+                && got[7].ends_with(" widget"),
+            "{}",
+            got[7]
+        );
+    }
+
+    #[test]
+    fn naming_the_primary_again_is_one_column() {
+        let tmp = TempDir::new();
+        let app = open(&ctx(&tmp), Some("proj".into())).unwrap();
+        assert_eq!(app.columns.len(), 1);
+    }
+
+    #[test]
+    fn the_dashboard_needs_its_projects() {
+        let tmp = TempDir::new();
+        let c = ctx(&tmp);
+        let err = |c: &Ctx, with: Option<&str>| open(c, with.map(String::from)).err().unwrap();
+        let nope = c.root.join("nope");
+        assert_eq!(
+            err(&c, Some("nope")),
+            format!("error: tasks dir not found: {}", nope.display())
+        );
+        let elsewhere = Ctx {
+            cwd: tmp.path().to_path_buf(),
+            ..ctx(&tmp)
+        };
+        assert_eq!(err(&elsewhere, None), "error: not in a git repo");
+        fs::write(c.root.join("projects.conf"), "Proj = gadget\n").unwrap();
+        assert!(err(&c, None).starts_with("error: tasks dir not found"));
+    }
 }
