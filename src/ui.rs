@@ -249,8 +249,13 @@ fn status_bar(app: &App, width: usize) -> Line<'static> {
     );
     let right = app.columns.get(1).map(|c| c.project.clone());
     let dim = Style::new().add_modifier(Modifier::DIM);
+    // Queued with nothing reported yet, there is no count to show.
+    let syncing = match app.progress {
+        Some(p) => format!("syncing {}/{}…", p.done, p.total),
+        None => "syncing…".to_string(),
+    };
     let (mids, style, outranks): (Vec<&str>, Style, bool) = if app.in_flight > 0 {
-        (vec!["syncing…"], Style::new(), true)
+        (vec![syncing.as_str()], Style::new(), true)
     } else if let Some(m) = &app.message {
         let style = if m.error {
             Style::new().fg(Color::Red)
@@ -495,6 +500,7 @@ fn clip(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::Progress;
     use crate::testutil::{PROJ, app, draw, key, lines, put};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -738,9 +744,11 @@ mod tests {
     fn a_result_outranks_the_second_name() {
         let (mut a, _tmp) = app(true);
         a.in_flight = 1;
+        a.progress = Some(Progress { done: 2, total: 5 });
         let t = draw(&mut a, 80, 4);
-        assert!(lines(&t)[3].contains(" syncing…"));
+        assert!(lines(&t)[3].contains(" syncing 2/5…"), "{}", lines(&t)[3]);
         a.in_flight = 0;
+        a.progress = None;
         a.message = Some(crate::app::Message::test(
             "error: a long line from git's stderr, cut to fit",
             true,
@@ -753,6 +761,40 @@ mod tests {
         );
         assert!(bar.ends_with('…') && !bar.contains("widget"), "{bar}");
         assert_eq!(t.backend().buffer()[(40, 3)].fg, Color::Red);
+    }
+
+    #[test]
+    fn the_bar_counts_the_running_batch_until_its_results() {
+        let (mut a, _tmp) = app(false);
+        let bar = |a: &mut App| lines(&draw(a, 80, 4))[3].clone();
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Down); // N001, then N002 slides under the cursor
+        let mut moved = vec![];
+        for _ in 0..2 {
+            key(&mut a, KeyCode::Char('m'));
+            moved.extend(key(&mut a, KeyCode::Char('d')));
+        }
+        let mut jobs = moved.into_iter().map(|e| match e {
+            crate::app::Effect::Run(job) => job,
+            e => panic!("{e:?}"),
+        });
+        // Queued, nothing reported yet.
+        assert!(bar(&mut a).ends_with(" syncing…"), "{}", bar(&mut a));
+        a.on_progress(Progress { done: 0, total: 5 });
+        assert!(bar(&mut a).ends_with(" syncing 0/5…"), "{}", bar(&mut a));
+        a.on_progress(Progress { done: 4, total: 5 });
+        assert!(bar(&mut a).ends_with(" syncing 4/5…"), "{}", bar(&mut a));
+        // Its results are in; the next batch has not reported.
+        let now = std::time::Instant::now();
+        a.on_job_done(jobs.next().unwrap(), Ok(String::new()), now);
+        assert_eq!(a.progress, None);
+        assert!(bar(&mut a).ends_with(" syncing…"), "{}", bar(&mut a));
+        a.on_job_done(jobs.next().unwrap(), Ok(String::new()), now);
+        assert!(
+            bar(&mut a).ends_with(" moved N002 to done"),
+            "{}",
+            bar(&mut a)
+        );
     }
 
     #[test]

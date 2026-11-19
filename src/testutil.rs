@@ -139,6 +139,33 @@ impl TasksRepo {
         git(&self.root(), &["rev-parse", "HEAD"])
             == git(&self.root(), &["rev-parse", "origin/main"])
     }
+
+    /// The last `n` commit subjects, newest first.
+    pub fn subjects(&self, n: usize) -> Vec<String> {
+        let n = format!("-{n}");
+        let log = git(&self.root(), &["log", &n, "--format=%s"]);
+        log.lines().map(String::from).collect()
+    }
+
+    /// Have origin count the pushes it receives from now on.
+    pub fn count_pushes(&self) {
+        self.hook("post-receive", "echo >> ../pushes");
+    }
+
+    pub fn pushes(&self) -> usize {
+        let log = self.tmp.path().join("pushes");
+        fs::read_to_string(log).map_or(0, |s| s.lines().count())
+    }
+
+    /// Have origin refuse every push from now on.
+    pub fn refuse_pushes(&self) {
+        self.hook("pre-receive", "echo refused >&2; exit 1");
+    }
+
+    fn hook(&self, name: &str, body: &str) {
+        let path = self.tmp.path().join("origin.git/hooks").join(name);
+        write_script(&path, &format!("#!/bin/sh\n{body}\n"));
+    }
 }
 
 /// What the app fixture's primary lists: an open queue, a blank line, the

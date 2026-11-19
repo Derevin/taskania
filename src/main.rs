@@ -34,7 +34,7 @@ use app::{App, Config, Effect, Job, ListOpts};
 use args::Parsed;
 use clock::Date;
 use engine::Engine;
-use tasks::Tasks;
+use tasks::{Progress, Tasks};
 
 /// How often the dashboard checks for changed task files.
 const POLL: Duration = Duration::from_secs(2);
@@ -162,21 +162,39 @@ fn open(ctx: &Ctx, with: Option<String>) -> Result<App, String> {
     Ok(app)
 }
 
-fn live(mut terminal: DefaultTerminal, mut app: App, engine: Engine) -> io::Result<()> {
-    // Changes run off the UI thread, one at a time, in the order they were made.
-    let (job_tx, job_rx) = mpsc::channel::<Job>();
-    let (done_tx, done_rx) = mpsc::channel();
-    let runner = engine.clone();
-    let worker = thread::spawn(move || {
-        for job in job_rx {
-            let result = runner.run(&job.call);
-            if done_tx.send((job, result)).is_err() {
-                break;
+/// What the worker sends back. One channel keeps the order: a batch's
+/// progress, then its results.
+enum Back {
+    Progress(Progress),
+    Done(Job, Result<String, String>),
+}
+
+/// Run changes off the UI thread in the order they were made, a batch at a
+/// time: whatever waits when the worker comes free. Changes arriving during a
+/// batch form the next one.
+fn work(engine: &Engine, jobs: &mpsc::Receiver<Job>, back: &mpsc::Sender<Back>) {
+    while let Ok(first) = jobs.recv() {
+        let mut batch = vec![first];
+        batch.extend(jobs.try_iter());
+        let report = |p| {
+            let _ = back.send(Back::Progress(p));
+        };
+        let results = engine.run(batch.iter().map(|j| &j.call), &report);
+        for (job, result) in batch.into_iter().zip(results) {
+            if back.send(Back::Done(job, result)).is_err() {
+                return;
             }
         }
-    });
+    }
+}
 
-    let result = run_loop(&mut terminal, &mut app, &engine, &job_tx, &done_rx);
+fn live(mut terminal: DefaultTerminal, mut app: App, engine: Engine) -> io::Result<()> {
+    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    let (back_tx, back_rx) = mpsc::channel();
+    let runner = engine.clone();
+    let worker = thread::spawn(move || work(&runner, &job_rx, &back_tx));
+
+    let result = run_loop(&mut terminal, &mut app, &engine, &job_tx, &back_rx);
 
     // A change already queued finishes, also when the loop failed: one cut off
     // between its commit and its push would leave the tasks repo out of step
@@ -195,7 +213,7 @@ fn run_loop(
     app: &mut App,
     engine: &Engine,
     job_tx: &mpsc::Sender<Job>,
-    done_rx: &mpsc::Receiver<(Job, Result<String, String>)>,
+    back_rx: &mpsc::Receiver<Back>,
 ) -> io::Result<()> {
     let dirs = app.project_dirs();
     let mut sig = watch::signature(&dirs);
@@ -223,8 +241,13 @@ fn run_loop(
         {
             effects.extend(app.on_key(key, Instant::now()));
         }
-        while let Ok((job, result)) = done_rx.try_recv() {
-            effects.extend(app.on_job_done(job, result, Instant::now()));
+        while let Ok(back) = back_rx.try_recv() {
+            match back {
+                Back::Progress(p) => app.on_progress(p),
+                Back::Done(job, result) => {
+                    effects.extend(app.on_job_done(job, result, Instant::now()));
+                }
+            }
         }
 
         let mut changed = false;
@@ -279,7 +302,8 @@ fn suspended<T>(terminal: &mut DefaultTerminal, f: impl FnOnce() -> T) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{TempDir, draw, git, lines, put};
+    use crate::engine::Call;
+    use crate::testutil::{TasksRepo, TempDir, draw, git, lines, put};
 
     /// A tasks root holding `proj` and `widget`, and a checkout of `proj`.
     fn ctx(tmp: &TempDir) -> Ctx {
@@ -380,5 +404,44 @@ mod tests {
         assert_eq!(err(&elsewhere, None), "error: not in a git repo");
         fs::write(c.root.join("projects.conf"), "Proj = gadget\n").unwrap();
         assert!(err(&c, None).starts_with("error: tasks dir not found"));
+    }
+
+    #[test]
+    fn what_waits_is_one_batch_its_progress_before_its_results() {
+        let r = TasksRepo::new(&["proj"]);
+        r.count_pushes();
+        let engine = Engine::new(Tasks::new(r.root()));
+        let (job_tx, job_rx) = mpsc::channel();
+        let (back_tx, back_rx) = mpsc::channel();
+        for title in ["one", "two"] {
+            let call = Call::Create {
+                project: "proj".into(),
+                letter: 'N',
+                title: title.into(),
+            };
+            job_tx
+                .send(Job {
+                    call,
+                    col: 0,
+                    key: None,
+                    done: String::new(),
+                })
+                .unwrap();
+        }
+        drop(job_tx);
+        work(&engine, &job_rx, &back_tx);
+        drop(back_tx);
+        let got: Vec<String> = back_rx
+            .iter()
+            .map(|back| match back {
+                Back::Progress(p) => format!("{}/{}", p.done, p.total),
+                Back::Done(_, result) => format!("{result:?}"),
+            })
+            .collect();
+        let mut want: Vec<String> = (0..=7).map(|n| format!("{n}/7")).collect();
+        want.push(r#"Ok("N001-one.md\n")"#.into());
+        want.push(r#"Ok("N002-two.md\n")"#.into());
+        assert_eq!(got, want);
+        assert_eq!(r.pushes(), 1);
     }
 }

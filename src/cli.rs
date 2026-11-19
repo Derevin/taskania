@@ -9,8 +9,10 @@ pub fn run(ctx: &Ctx, project: Option<String>, verb: Verb) -> Result<String, Str
     let tasks = ctx.tasks();
     let explicit = project.is_some();
     let project = || project.clone().map_or_else(|| ctx.cwd_project(), Ok);
-    match verb {
-        Verb::List(a) => list(&tasks, &project()?, &a),
+    let change = match verb {
+        Verb::List(a) => return list(&tasks, &project()?, &a),
+        Verb::NextId => return tasks.next_id(&project()?),
+        Verb::Project => return Ok(format!("{}\n", ctx.cwd_project()?)),
         Verb::Claim(file) => tasks.claim(&project()?, &file),
         Verb::Planned(file) => tasks.planned(&project()?, &file),
         Verb::Unclaim(file) => tasks.unclaim(&project()?, &file),
@@ -19,10 +21,9 @@ pub fn run(ctx: &Ctx, project: Option<String>, verb: Verb) -> Result<String, Str
         Verb::Reprioritize { task, letter } => tasks.reprioritize(&project()?, &task, &letter),
         // A project named by hand must exist: a typo must not start a new one.
         Verb::Create { letter, title } => tasks.create(&project()?, !explicit, &letter, &title),
-        Verb::NextId => tasks.next_id(&project()?),
         Verb::Commit(message) => tasks.commit(&message),
-        Verb::Project => Ok(format!("{}\n", ctx.cwd_project()?)),
-    }
+    };
+    tasks.publish_one(change)
 }
 
 fn list(tasks: &Tasks, project: &str, a: &ListArgs) -> Result<String, String> {

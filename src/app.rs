@@ -13,6 +13,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::clock::Date;
 use crate::engine::Call;
 use crate::listing::{self, Row, Spec, Status, Task, TaskKey};
+use crate::tasks::Progress;
 use crate::watch::{self, Stamp};
 
 /// How long the cursor outlives the last key.
@@ -137,6 +138,9 @@ pub struct App {
     pub editor: Option<String>,
     /// Jobs queued or running.
     pub in_flight: usize,
+    /// The running batch's progress; None until it reports, and once its
+    /// results are in.
+    pub progress: Option<Progress>,
     pub pending: Vec<(usize, TaskKey)>,
     pub message: Option<Message>,
     /// Lines the peek shows at once, for paging; kept by the renderer.
@@ -167,6 +171,7 @@ impl App {
             today: Date::today(),
             editor: cfg.editor,
             in_flight: 0,
+            progress: None,
             pending: vec![],
             message: None,
             peek_rows: 20,
@@ -688,12 +693,18 @@ impl App {
 
     // --- results -----------------------------------------------------------
 
+    pub fn on_progress(&mut self, progress: Progress) {
+        self.progress = Some(progress);
+    }
+
+    /// A job's result. A batch's results come after its last progress.
     pub fn on_job_done(
         &mut self,
         job: Job,
         result: Result<String, String>,
         now: Instant,
     ) -> Vec<Effect> {
+        self.progress = None;
         self.in_flight = self.in_flight.saturating_sub(1);
         if let Some(key) = &job.key
             && let Some(i) = self

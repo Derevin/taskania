@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{Command, ExitStatus};
 
 use crate::listing::Status;
-use crate::tasks::Tasks;
+use crate::tasks::{Progress, Tasks};
 
 /// A change, as one verb makes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,31 +53,44 @@ impl Engine {
         }
     }
 
-    /// Make a change. Ok holds what the verb prints; Err the last line of its
+    /// Make a batch of changes, telling `report` how far it is. One result per
+    /// call, in order: Ok holds what the verb prints; Err the last line of its
     /// error, which is what fits the bar.
-    pub fn run(&self, call: &Call) -> Result<String, String> {
+    pub fn run<'c>(
+        &self,
+        calls: impl IntoIterator<Item = &'c Call>,
+        report: &dyn Fn(Progress),
+    ) -> Vec<Result<String, String>> {
         let t = &self.tasks;
-        let result = match call {
-            Call::Move { project, file, to } => t.move_task(project, file, to.dir()),
-            Call::Create {
-                project,
-                letter,
-                title,
-            } => t.create(project, false, &letter.to_string(), title),
-            Call::Reprioritize {
-                project,
-                file,
-                letter,
-            } => t.reprioritize(project, file, &letter.to_string()),
-            Call::Commit { message } => t.commit(message),
-        };
-        result.map_err(|e| {
-            e.lines()
-                .map(str::trim)
-                .rfind(|l| !l.is_empty())
-                .unwrap_or("")
-                .to_string()
-        })
+        let batch = calls
+            .into_iter()
+            .map(|call| match call {
+                Call::Move { project, file, to } => t.move_task(project, file, to.dir()),
+                Call::Create {
+                    project,
+                    letter,
+                    title,
+                } => t.create(project, false, &letter.to_string(), title),
+                Call::Reprioritize {
+                    project,
+                    file,
+                    letter,
+                } => t.reprioritize(project, file, &letter.to_string()),
+                Call::Commit { message } => t.commit(message),
+            })
+            .collect();
+        t.publish(batch, report)
+            .into_iter()
+            .map(|result| {
+                result.map_err(|e| {
+                    e.lines()
+                        .map(str::trim)
+                        .rfind(|l| !l.is_empty())
+                        .unwrap_or("")
+                        .to_string()
+                })
+            })
+            .collect()
     }
 
     /// Run the editor on `file` in this terminal. The value is a shell command,
@@ -124,9 +137,8 @@ mod tests {
                 title: "fix the sensor".into(),
             },
         ];
-        let outs: Vec<_> = calls.iter().map(|c| e.run(c)).collect();
         assert_eq!(
-            outs,
+            e.run(&calls, &|_| {}),
             vec![
                 Ok("--- Moved: N001-x.md todo -> done ---\n".into()),
                 Ok("--- N002-y.md -> H002-y.md (todo) ---\n".into()),
@@ -141,7 +153,7 @@ mod tests {
         let commit = Call::Commit {
             message: "Edit: x".into(),
         };
-        assert_eq!(e.run(&commit), Ok(String::new()));
+        assert_eq!(e.run([&commit], &|_| {}), vec![Ok(String::new())]);
         assert_eq!(r.subject(), "Edit: x");
         assert!(r.pushed());
     }
@@ -156,16 +168,15 @@ mod tests {
             file: "N001-x.md".into(),
             to: Status::Stale,
         };
-        assert_eq!(
-            e.run(&stale),
-            Err("error: only an active task goes stale (N001-x.md is in todo/)".into())
-        );
         let nothing = Call::Commit {
             message: "m".into(),
         };
         assert_eq!(
-            e.run(&nothing),
-            Err("nothing to commit, working tree clean".into())
+            e.run([&stale, &nothing], &|_| {}),
+            vec![
+                Err("error: only an active task goes stale (N001-x.md is in todo/)".into()),
+                Err("nothing to commit, working tree clean".into()),
+            ]
         );
     }
 
