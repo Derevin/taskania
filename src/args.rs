@@ -26,9 +26,11 @@ Taskania's dashboard: the cwd's project's tasks, live, with a cursor to peek, ed
 Usage: taskania --watch [--with NAME]
 --with draws a second project's list right-aligned beside it.
 Below the open queue come done then canceled since a marker 7 days back.
-Keys: left/right move the done-since marker, d s toggle row dates and the stale section, q quits.
-up/down move the row cursor, tab hops columns, esc hides it. On a row: enter peeks,
-e edits, m moves, p sets the priority. n creates a task.";
+Keys: up/down move the row cursor, left/right hop to that column, esc hides it.
+On a row: enter peeks, e edits, m moves, p sets the priority. n creates a task.
+v opens the view menu: left/right move the done-since marker, enter applies it,
+d s toggle row dates and the stale section, esc closes. q or ctrl-c quits.
+In a peek: up/down scroll, pgdn/space and pgup page, home/end jump, esc/enter/q close.";
 
 /// A verb's name, the help it prints, and whether it takes `--project`.
 struct Spec {

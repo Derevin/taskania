@@ -20,7 +20,7 @@ pub const CURSOR_TIMEOUT: Duration = Duration::from_secs(60);
 const INFO_FOR: Duration = Duration::from_secs(5);
 const ERROR_FOR: Duration = Duration::from_secs(30);
 
-/// What the listing shows, each toggled by a key.
+/// What the listing shows, set from the view menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListOpts {
     /// Days of done and canceled below the open queue.
@@ -67,6 +67,10 @@ pub enum Mode {
     Move(Task),
     Prio(Task),
     Form(Form),
+    /// The view menu, holding the done window it would apply, in days.
+    View {
+        recent: u32,
+    },
 }
 
 pub struct Peek {
@@ -322,31 +326,17 @@ impl App {
             Mode::Move(_) => self.move_key(key.code),
             Mode::Prio(_) => self.prio_key(key.code, now),
             Mode::Form(_) => self.form_key(key.code),
+            Mode::View { .. } => self.view_key(key.code),
         }
     }
 
     fn normal_key(&mut self, code: KeyCode, now: Instant) -> Vec<Effect> {
         match code {
             KeyCode::Char('q') => vec![Effect::Quit],
-            KeyCode::Left => {
-                self.opts.recent += 1;
-                vec![Effect::Relist]
-            }
-            KeyCode::Right if self.opts.recent > 1 => {
-                self.opts.recent -= 1;
-                vec![Effect::Relist]
-            }
-            KeyCode::Char('d') => {
-                self.opts.dates = !self.opts.dates;
-                vec![Effect::Relist]
-            }
-            KeyCode::Char('s') => {
-                self.opts.stale = !self.opts.stale;
-                vec![Effect::Relist]
-            }
             KeyCode::Down => self.step(true),
             KeyCode::Up => self.step(false),
-            KeyCode::Tab | KeyCode::BackTab => self.hop(),
+            KeyCode::Left => self.hop(0),
+            KeyCode::Right => self.hop(1),
             KeyCode::Esc => {
                 self.hide();
                 self.message = None;
@@ -357,6 +347,12 @@ impl App {
             KeyCode::Char('m') => self.open_move(),
             KeyCode::Char('p') => self.open_prio(now),
             KeyCode::Char('n') => self.open_form(),
+            KeyCode::Char('v') => {
+                self.mode = Mode::View {
+                    recent: self.opts.recent,
+                };
+                vec![]
+            }
             _ => vec![],
         }
     }
@@ -397,20 +393,22 @@ impl App {
         }
     }
 
-    /// Tab: to the other column, on the task row nearest the same screen row.
-    fn hop(&mut self) -> Vec<Effect> {
-        if self.columns.len() < 2 {
-            return vec![];
-        }
+    /// Left/Right: to column `to`, on the task row nearest the same screen
+    /// row. No wrap: toward the column the cursor is in does nothing. The
+    /// first press reveals the cursor in `to`, else in the other column.
+    fn hop(&mut self, to: usize) -> Vec<Effect> {
+        let to = to.min(self.columns.len() - 1);
         let Some(c) = self.cursor.clone() else {
-            self.reveal(1);
+            self.reveal(to);
             return vec![];
         };
-        let other = 1 - c.col;
+        if c.col == to {
+            return vec![];
+        }
         let screen_row = c.row.saturating_sub(self.columns[c.col].offset);
-        if let Some(row) = self.nearest(other, screen_row) {
+        if let Some(row) = self.nearest(to, screen_row) {
             self.columns[c.col].offset = 0;
-            self.cursor = Some(self.cursor_at(other, row));
+            self.cursor = Some(self.cursor_at(to, row));
         }
         vec![]
     }
@@ -642,6 +640,44 @@ impl App {
         vec![]
     }
 
+    /// The arrows move the done window's start without relisting; Enter
+    /// applies it. A toggle applies only itself, dropping the pending start.
+    fn view_key(&mut self, code: KeyCode) -> Vec<Effect> {
+        let Mode::View { recent } = &mut self.mode else {
+            return vec![];
+        };
+        let opts = match code {
+            KeyCode::Left => {
+                *recent += 1;
+                return vec![];
+            }
+            KeyCode::Right if *recent > 1 => {
+                *recent -= 1;
+                return vec![];
+            }
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                return vec![];
+            }
+            KeyCode::Enter => ListOpts {
+                recent: *recent,
+                ..self.opts
+            },
+            KeyCode::Char('d') => ListOpts {
+                dates: !self.opts.dates,
+                ..self.opts
+            },
+            KeyCode::Char('s') => ListOpts {
+                stale: !self.opts.stale,
+                ..self.opts
+            },
+            _ => return vec![],
+        };
+        self.opts = opts;
+        self.mode = Mode::Normal;
+        vec![Effect::Relist]
+    }
+
     fn queue(&mut self, job: Job) -> Vec<Effect> {
         self.in_flight += 1;
         if let Some(key) = &job.key {
@@ -748,7 +784,8 @@ impl App {
     // --- time --------------------------------------------------------------
 
     /// The cursor hides after a minute without a key, restoring the idle
-    /// frame; a peek or a half-typed form stays until dismissed.
+    /// frame; a peek, a half-typed form or the view menu stays until
+    /// dismissed.
     pub fn tick(&mut self, now: Instant) {
         let row_bound = matches!(self.mode, Mode::Normal | Mode::Move(_) | Mode::Prio(_));
         if self.cursor.is_some() && row_bound && now.duration_since(self.last_key) >= CURSOR_TIMEOUT
@@ -951,22 +988,70 @@ mod tests {
     }
 
     #[test]
-    fn tab_hops_columns_and_reveals_in_the_second() {
+    fn left_and_right_hop_to_their_column_without_wrapping() {
         let (mut a, _tmp) = app(true);
-        key(&mut a, KeyCode::Tab);
-        assert_eq!(on(&a), Some("1:N007".into()));
-        key(&mut a, KeyCode::Tab);
+        key(&mut a, KeyCode::Right);
+        assert_eq!(on(&a), Some("1:N007".into()), "revealed in the right");
+        key(&mut a, KeyCode::Right);
+        assert_eq!(on(&a), Some("1:N007".into()), "no wrap past the right");
+        assert_eq!(key(&mut a, KeyCode::Left), vec![]);
         assert_eq!(
             on(&a),
             Some("0:H010".into()),
             "row 1 of the second is beside row 1 of the first"
         );
+        key(&mut a, KeyCode::Left);
+        assert_eq!(on(&a), Some("0:H010".into()), "no wrap past the left");
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Right);
+        assert_eq!(on(&a), Some("1:N008".into()));
+
+        key(&mut a, KeyCode::Esc);
+        key(&mut a, KeyCode::Left);
+        assert_eq!(on(&a), Some("0:H010".into()), "revealed in the left");
+        assert_eq!(a.opts, ListOpts::default(), "arrows leave the view alone");
+    }
+
+    #[test]
+    fn either_arrow_reveals_the_cursor_in_a_single_column() {
+        for arrow in [KeyCode::Left, KeyCode::Right] {
+            let (mut a, _tmp) = app(false);
+            key(&mut a, arrow);
+            assert_eq!(on(&a), Some("0:H010".into()), "{arrow:?}");
+            key(&mut a, KeyCode::Down);
+            key(&mut a, arrow);
+            assert_eq!(on(&a), Some("0:N001".into()), "{arrow:?} then stays");
+        }
+    }
+
+    #[test]
+    fn an_arrow_toward_a_column_without_tasks_stays_put() {
+        let (mut a, tmp) = app(true);
+        fs::remove_dir_all(tmp.path().join("widget/todo")).unwrap();
+        a.relist();
+        key(&mut a, KeyCode::Right);
+        assert_eq!(on(&a), Some("0:H010".into()), "the reveal falls back");
+        key(&mut a, KeyCode::Right);
+        assert_eq!(on(&a), Some("0:H010".into()));
+    }
+
+    #[test]
+    fn tab_d_and_s_do_nothing_at_the_top_level() {
+        let (mut a, _tmp) = app(true);
+        for code in [
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Char('d'),
+            KeyCode::Char('s'),
+        ] {
+            assert_eq!(key(&mut a, code), vec![], "{code:?}");
+            assert_eq!(a.cursor, None, "{code:?}");
+        }
         key(&mut a, KeyCode::Down);
         key(&mut a, KeyCode::Tab);
-        assert_eq!(on(&a), Some("1:N008".into()));
-        let (mut solo, _solo) = app(false);
-        key(&mut solo, KeyCode::Tab);
-        assert_eq!(solo.cursor, None);
+        key(&mut a, KeyCode::BackTab);
+        assert_eq!(on(&a), Some("0:H010".into()));
+        assert_eq!(a.opts, ListOpts::default());
     }
 
     #[test]
@@ -983,26 +1068,74 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_view_keys_toggle_what_is_listed() {
-        let (mut a, tmp) = app(false);
-        assert_eq!(key(&mut a, KeyCode::Left), vec![Effect::Relist]);
-        assert_eq!(a.opts.recent, 8);
-        key(&mut a, KeyCode::Right);
-        key(&mut a, KeyCode::Right);
-        assert_eq!(a.opts.recent, 6);
-        a.opts.recent = 1;
-        assert_eq!(key(&mut a, KeyCode::Right), vec![]);
-        assert_eq!(a.opts.recent, 1);
+    fn pending(a: &App) -> Option<u32> {
+        match a.mode {
+            Mode::View { recent } => Some(recent),
+            _ => None,
+        }
+    }
 
+    #[test]
+    fn the_view_menu_moves_a_pending_date_and_enter_applies_it() {
+        let (mut a, _tmp) = app(false);
+        assert_eq!(key(&mut a, KeyCode::Char('v')), vec![]);
+        assert_eq!(pending(&a), Some(7));
+        assert_eq!(a.cursor, None, "opens without a cursor");
+        assert_eq!(key(&mut a, KeyCode::Left), vec![], "no relist per key");
+        key(&mut a, KeyCode::Left);
+        key(&mut a, KeyCode::Right);
+        assert_eq!(pending(&a), Some(8));
+        assert_eq!(a.opts.recent, 7, "the list keeps the applied window");
+        assert_eq!(key(&mut a, KeyCode::Enter), vec![Effect::Relist]);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!(a.opts.recent, 8);
+    }
+
+    #[test]
+    fn the_pending_date_stops_at_yesterday() {
+        let (mut a, _tmp) = app(false);
+        a.opts.recent = 2;
+        key(&mut a, KeyCode::Char('v'));
+        key(&mut a, KeyCode::Right);
+        key(&mut a, KeyCode::Right);
+        assert_eq!(pending(&a), Some(1));
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.opts.recent, 1);
+    }
+
+    #[test]
+    fn esc_closes_the_view_menu_and_discards_the_pending_date() {
+        let (mut a, _tmp) = app(false);
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Char('v'));
+        key(&mut a, KeyCode::Left);
+        assert_eq!(key(&mut a, KeyCode::Esc), vec![]);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!(a.opts.recent, 7);
+        assert_eq!(on(&a), Some("0:H010".into()), "the cursor stays");
+        key(&mut a, KeyCode::Char('v'));
+        assert_eq!(pending(&a), Some(7), "starts from the applied window");
+    }
+
+    #[test]
+    fn the_view_toggles_close_the_menu_and_discard_the_pending_date() {
+        let (mut a, tmp) = app(false);
         put(tmp.path(), "proj", "stale", "N004-paused.md", "");
         a.relist();
         assert!(!listed(&a).contains("STALE"), "stale starts hidden");
+        key(&mut a, KeyCode::Char('v'));
+        key(&mut a, KeyCode::Left);
         assert_eq!(key(&mut a, KeyCode::Char('s')), vec![Effect::Relist]);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!(a.opts.recent, 7, "the pending date is dropped");
         a.relist();
         assert!(listed(&a).contains("STALE (1)\n  N004 paused\nTODO (3)"));
 
-        key(&mut a, KeyCode::Char('d'));
+        key(&mut a, KeyCode::Char('v'));
+        key(&mut a, KeyCode::Left);
+        assert_eq!(key(&mut a, KeyCode::Char('d')), vec![Effect::Relist]);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert_eq!(a.opts.recent, 7);
         a.relist();
         let today = Date::today().dd_mm();
         assert!(listed(&a).contains(&format!("  H010 busy ({today})")));
@@ -1011,7 +1144,41 @@ mod tests {
         a.opts.recent = 0;
         a.relist();
         assert!(!listed(&a).contains("DONE"), "an empty window hides done");
+    }
 
+    #[test]
+    fn other_keys_do_nothing_in_the_view_menu() {
+        let (mut a, _tmp) = app(true);
+        key(&mut a, KeyCode::Char('v'));
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Char('l'),
+            KeyCode::Char('v'),
+            KeyCode::Down,
+            KeyCode::Tab,
+        ] {
+            assert_eq!(key(&mut a, code), vec![], "{code:?}");
+            assert_eq!(pending(&a), Some(7), "{code:?}");
+        }
+        assert_eq!(a.cursor, None);
+    }
+
+    #[test]
+    fn a_relist_keeps_the_view_menu_open() {
+        let (mut a, tmp) = app(false);
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Down); // N001
+        key(&mut a, KeyCode::Char('v'));
+        key(&mut a, KeyCode::Left);
+        fs::remove_file(tmp.path().join("proj/todo/N001-alpha.md")).unwrap();
+        a.relist();
+        assert_eq!(on(&a), Some("0:N002".into()));
+        assert_eq!(pending(&a), Some(8), "not tied to a task");
+    }
+
+    #[test]
+    fn unbound_keys_do_nothing_and_q_quits() {
+        let (mut a, _tmp) = app(false);
         assert_eq!(key(&mut a, KeyCode::Char('l')), vec![], "no lab tags");
         assert_eq!(key(&mut a, KeyCode::Char('q')), vec![Effect::Quit]);
     }
@@ -1194,11 +1361,6 @@ mod tests {
         fs::remove_file(tmp.path().join("proj/todo/N001-alpha.md")).unwrap();
         a.relist();
         assert!(matches!(a.mode, Mode::Normal));
-        assert_eq!(
-            key(&mut a, KeyCode::Char('d')),
-            vec![Effect::Relist],
-            "d is the dates toggle again"
-        );
     }
 
     #[test]
@@ -1260,7 +1422,7 @@ mod tests {
     #[test]
     fn the_second_columns_task_is_acted_on_in_its_project() {
         let (mut a, _tmp) = app(true);
-        key(&mut a, KeyCode::Tab); // N007, widget
+        key(&mut a, KeyCode::Right); // N007, widget
         key(&mut a, KeyCode::Char('p'));
         assert!(matches!(a.mode, Mode::Prio(_)));
         assert_eq!(
@@ -1284,16 +1446,17 @@ mod tests {
     }
 
     #[test]
-    fn the_timeout_closes_a_menu_but_not_a_form_or_a_peek() {
+    fn the_timeout_closes_a_row_menu_but_not_the_view_menu_a_form_or_a_peek() {
         let t0 = Instant::now();
         let later = t0 + CURSOR_TIMEOUT;
-        for (open, survives) in [('m', false), ('p', false), ('n', true)] {
+        for (open, survives) in [('m', false), ('p', false), ('n', true), ('v', true)] {
             let (mut a, _tmp) = app(false);
             a.on_key(KeyEvent::from(KeyCode::Down), t0);
             a.on_key(KeyEvent::from(KeyCode::Down), t0); // N001
             a.on_key(KeyEvent::from(KeyCode::Char(open)), t0);
             a.tick(later);
             assert_eq!(!matches!(a.mode, Mode::Normal), survives, "{open}");
+            assert_eq!(a.cursor.is_some(), survives, "{open}: the cursor");
         }
         let (mut a, _tmp) = app(false);
         a.on_key(KeyEvent::from(KeyCode::Down), t0);
@@ -1321,7 +1484,7 @@ mod tests {
             }]
         );
 
-        key(&mut a, KeyCode::Tab); // cursor into the second column
+        key(&mut a, KeyCode::Right); // cursor into the second column
         key(&mut a, KeyCode::Char('n'));
         chars(&mut a, "x");
         let calls = jobs(key(&mut a, KeyCode::Enter));

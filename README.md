@@ -48,17 +48,16 @@ Shows the current directory's project; `--with` adds a second project's list, ri
 
 | Key | Does |
 |-----|------|
-| `←` `→` | widen or narrow the done window by a day |
-| `d` `s` | toggle row dates, the stale section |
 | `↑` `↓` | move the row cursor; the first press shows it |
-| `Tab` | hop to the other column |
+| `←` `→` | hop to the left or right column; the first press shows the cursor there |
 | `Esc` | hide the cursor (it also hides after a minute without a key) |
-| `Enter` | peek: the task file, scrollable |
+| `Enter` | peek: the task file; `↑` `↓` scroll, `PgDn` `Space` `PgUp` page, `Home` `End` jump, `Esc` `Enter` `q` close |
 | `e` | edit the task file in `$VISUAL` or `$EDITOR`, then commit it |
 | `m` | move: `t` todo, `p` planned, `s` stale, `d` done, `c` canceled |
 | `p` | set the priority letter, A to Z |
 | `n` | create a task: a priority letter and a title |
-| `q` | quit |
+| `v` | view menu: `←` `→` move the done window's start a day, `Enter` applies it; `d` `s` toggle row dates, the stale section; `Esc` closes |
+| `q` `Ctrl-C` | quit |
 
 Changes run in the background, one at a time, in order; the bottom bar says `syncing…` until they land.
 

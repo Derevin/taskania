@@ -1,8 +1,8 @@
 //! Drawing. The list area: each column clipped to its
 //! width, a list taller than the body cut to `rows-1` lines and `  +N more`, a
 //! second column as wide as its longest line (at most half the pane) flush with
-//! the right edge. On top of it: the cursor, the bar, the move and priority
-//! prompts, the create form and the peek overlay.
+//! the right edge. On top of it: the cursor, the bar, the move, priority and
+//! view prompts, the create form and the peek overlay.
 
 use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::layout::{Position, Rect};
@@ -14,10 +14,10 @@ use crate::app::{App, Form, MOVES, Mode};
 use crate::listing::Task;
 
 const GUTTER: usize = 2;
-const IDLE_HINTS: [&str; 2] = ["(↑↓ select, n new, ←→ d s q)", "(↑↓ ←→ d s n q)"];
+const IDLE_HINTS: [&str; 2] = ["(↑↓←→ select, n new, v view, q)", "(↑↓←→ n v q)"];
 const CURSOR_HINTS: [&str; 2] = [
-    "(⏎ peek, e edit, m move, p prio, n new, esc)",
-    "(⏎ e m p n esc)",
+    "(⏎ peek, e edit, m move, p prio, n new, v view, esc)",
+    "(⏎ e m p n v esc)",
 ];
 
 /// Draw the pane. Returns where the text cursor belongs, if it shows at all.
@@ -171,8 +171,50 @@ fn bar(app: &App, width: usize) -> Line<'static> {
             spans.push(Span::raw("  esc"));
             Line::from(spans)
         }
+        Mode::View { recent } => view_menu(app, *recent, width),
         _ => status_bar(app, width),
     }
+}
+
+/// The view menu: the pending done window, then the toggles and their state.
+/// A narrow pane loses `esc`, then `⏎`; past that the bar clips its right end.
+fn view_menu(app: &App, recent: u32, width: usize) -> Line<'static> {
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let state = |on: bool| if on { "on" } else { "off" };
+    let menu = |enter: bool, esc: bool| {
+        let mut spans = vec![
+            Span::raw(format!("view: {} ", done_between(app, recent))),
+            Span::styled("←→", bold),
+        ];
+        if enter {
+            spans.extend([Span::raw(" "), Span::styled("⏎", bold)]);
+        }
+        spans.extend([
+            Span::raw("  "),
+            Span::styled("d", bold),
+            Span::raw(format!(" dates:{}", state(app.opts.dates))),
+            Span::raw("  "),
+            Span::styled("s", bold),
+            Span::raw(format!(" stale:{}", state(app.opts.stale))),
+        ]);
+        if esc {
+            spans.push(Span::raw("  esc"));
+        }
+        Line::from(spans)
+    };
+    [menu(true, true), menu(true, false)]
+        .into_iter()
+        .find(|line| line.width() <= width)
+        .unwrap_or_else(|| menu(false, false))
+}
+
+/// The done window as the bar words it: `recent` days back to today.
+fn done_between(app: &App, recent: u32) -> String {
+    format!(
+        "done between {} and {}",
+        app.today.minus_days(recent).marker(),
+        app.today.dd_mm()
+    )
 }
 
 /// The move menu: every target, the ones the move would refuse dimmed.
@@ -201,10 +243,9 @@ fn move_menu(task: &Task) -> Line<'static> {
 /// outranks it.
 fn status_bar(app: &App, width: usize) -> Line<'static> {
     let left = format!(
-        "{}, done between {} and {}",
+        "{}, {}",
         app.columns[0].project,
-        app.today.minus_days(app.opts.recent).marker(),
-        app.today.dd_mm()
+        done_between(app, app.opts.recent)
     );
     let right = app.columns.get(1).map(|c| c.project.clone());
     let dim = Style::new().add_modifier(Modifier::DIM);
@@ -569,7 +610,7 @@ mod tests {
         );
         assert!(!modifier(&t, 0, 3).contains(Modifier::REVERSED));
         assert!(
-            lines(&t)[11].contains("(⏎ e m p n esc)"),
+            lines(&t)[11].contains("(⏎ e m p n v esc)"),
             "the bar shows the row keys"
         );
     }
@@ -589,7 +630,7 @@ mod tests {
             "scrolled as little as shows the cursor"
         );
 
-        key(&mut a, KeyCode::Tab);
+        key(&mut a, KeyCode::Right);
         let got = lines(&draw(&mut a, 80, 6));
         assert!(
             got[0].starts_with("ACTIVE (1)"),
@@ -622,7 +663,7 @@ mod tests {
         let t = draw(&mut a, 64, 4);
         let bar = &lines(&t)[3];
         assert!(bar.ends_with(" widget"), "{bar}");
-        assert!(bar.contains("(↑↓ ←→ d s n q)"), "the short hints: {bar}");
+        assert!(bar.contains("(↑↓←→ n v q)"), "the short hints: {bar}");
         let t = draw(&mut a, 45, 4);
         assert_eq!(
             lines(&t)[3],
@@ -630,6 +671,67 @@ mod tests {
         );
         let t = draw(&mut a, 30, 4);
         assert_eq!(lines(&t)[3], "proj, done between Mo 09-11 an");
+    }
+
+    #[test]
+    fn a_wide_bar_spells_the_hints_out() {
+        let (mut a, _tmp) = app(false);
+        let left = "proj, done between Mo 09-11 and 16-11";
+        assert_eq!(
+            lines(&draw(&mut a, 100, 4))[3],
+            format!("{left} (↑↓←→ select, n new, v view, q)")
+        );
+        key(&mut a, KeyCode::Down);
+        assert_eq!(
+            lines(&draw(&mut a, 100, 4))[3],
+            format!("{left} (⏎ peek, e edit, m move, p prio, n new, v view, esc)")
+        );
+    }
+
+    #[test]
+    fn the_view_menu_takes_the_bar_with_the_pending_date() {
+        let (mut a, _tmp) = app(true);
+        key(&mut a, KeyCode::Char('v'));
+        let t = draw(&mut a, 80, 4);
+        let menu = "view: done between Mo 09-11 and 16-11 ←→ ⏎  d dates:off  s stale:off  esc";
+        assert_eq!(lines(&t)[3], menu);
+        let bold = |k: &str| {
+            let x = menu[..menu.find(k).unwrap()].chars().count() as u16;
+            modifier(&t, x, 3).contains(Modifier::BOLD)
+        };
+        assert!(bold("←→") && bold("⏎") && bold("d dates") && bold("s stale"));
+        assert!(!bold("view") && !bold("dates:") && !bold("esc"));
+
+        key(&mut a, KeyCode::Left);
+        assert!(
+            lines(&draw(&mut a, 80, 4))[3].starts_with("view: done between Su 08-11 and 16-11 ←→"),
+            "the pending date, not the applied one"
+        );
+        a.opts.dates = true;
+        a.opts.stale = true;
+        assert!(lines(&draw(&mut a, 80, 4))[3].ends_with("  d dates:on  s stale:on  esc"));
+    }
+
+    #[test]
+    fn a_narrow_view_menu_drops_esc_then_enter_then_clips() {
+        let (mut a, _tmp) = app(false);
+        key(&mut a, KeyCode::Char('v'));
+        let date = "view: done between Mo 09-11 and 16-11";
+        let bar = |a: &mut App, w| lines(&draw(a, w, 4))[3].clone();
+        assert_eq!(
+            bar(&mut a, 73),
+            format!("{date} ←→ ⏎  d dates:off  s stale:off  esc")
+        );
+        assert_eq!(
+            bar(&mut a, 72),
+            format!("{date} ←→ ⏎  d dates:off  s stale:off")
+        );
+        assert_eq!(
+            bar(&mut a, 67),
+            format!("{date} ←→  d dates:off  s stale:off")
+        );
+        assert_eq!(bar(&mut a, 50), format!("{date} ←→  d dates:"));
+        assert_eq!(bar(&mut a, 30), "view: done between Mo 09-11 an");
     }
 
     #[test]
