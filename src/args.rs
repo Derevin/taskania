@@ -129,7 +129,8 @@ Print the cwd's project.
 Usage: taskania project
 A .find-project.conf in the cwd or its nearest ancestor names it: a project = NAME line, else
 its first line. Otherwise the git checkout's directory name, lab suffix stripped, mapped through
-$TASKANIA_PROJECTS_CONF (default $TASKS_ROOT/projects.conf: name = project lines), else lowercased.",
+$TASKANIA_PROJECTS_CONF (default $XDG_CONFIG_HOME/taskania/projects.conf, ~/.config when unset:
+name = project lines), else lowercased.",
     },
 ];
 

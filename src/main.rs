@@ -49,17 +49,22 @@ pub struct Ctx {
 
 impl Ctx {
     fn from_env() -> Ctx {
-        let root = env_nonempty("TASKS_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(env_nonempty("HOME").unwrap_or_default()).join("repos/tasks")
-            });
-        let projects_conf = env_nonempty("TASKANIA_PROJECTS_CONF")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| root.join("projects.conf"));
+        Ctx::from_vars(|name| std::env::var(name).ok(), logical_cwd())
+    }
+
+    /// An empty variable counts as unset.
+    fn from_vars(var: impl Fn(&str) -> Option<String>, cwd: PathBuf) -> Ctx {
+        let var = |name| var(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+        let home = || var("HOME").unwrap_or_default();
+        let root = var("TASKS_ROOT").unwrap_or_else(|| home().join("repos/tasks"));
+        let projects_conf = var("TASKANIA_PROJECTS_CONF").unwrap_or_else(|| {
+            var("XDG_CONFIG_HOME")
+                .unwrap_or_else(|| home().join(".config"))
+                .join("taskania/projects.conf")
+        });
         Ctx {
             root,
-            cwd: logical_cwd(),
+            cwd,
             projects_conf,
         }
     }
@@ -315,6 +320,39 @@ mod tests {
                 && got[7].ends_with(" widget"),
             "{}",
             got[7]
+        );
+    }
+
+    #[test]
+    fn the_projects_conf_defaults_to_the_xdg_config_dir() {
+        let conf = |vars: &[(&str, &str)]| {
+            let var = |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            };
+            Ctx::from_vars(var, PathBuf::new()).projects_conf
+        };
+        let home = ("HOME", "/h");
+        assert_eq!(
+            conf(&[home]),
+            PathBuf::from("/h/.config/taskania/projects.conf")
+        );
+        assert_eq!(
+            conf(&[home, ("XDG_CONFIG_HOME", "")]),
+            PathBuf::from("/h/.config/taskania/projects.conf")
+        );
+        assert_eq!(
+            conf(&[home, ("XDG_CONFIG_HOME", "/x")]),
+            PathBuf::from("/x/taskania/projects.conf")
+        );
+        assert_eq!(
+            conf(&[
+                home,
+                ("XDG_CONFIG_HOME", "/x"),
+                ("TASKANIA_PROJECTS_CONF", "/p.conf")
+            ]),
+            PathBuf::from("/p.conf")
         );
     }
 

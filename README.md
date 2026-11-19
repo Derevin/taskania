@@ -36,7 +36,7 @@ taskania project                  print the current directory's project
 
 `FILE` is a task's filename, with or without `.md`. Every verb but `commit` and `project` acts on the current directory's project, or on the one named by `--project NAME`. `taskania VERB --help` explains each.
 
-The current directory's project is named by a `.find-project.conf` in it or its nearest ancestor (a `project = NAME` line, or a bare name). Otherwise it is the git checkout's directory name with any lab suffix (`-hlab-…`, `-dlab-…`, `-clab-…`, `-hwt<N>…`, `-dwt…`, `-cwt…`) stripped, looked up in `$TASKANIA_PROJECTS_CONF` (default `$TASKS_ROOT/projects.conf`, lines `name = project`), else lowercased.
+The current directory's project is named by a `.find-project.conf` in it or its nearest ancestor (a `project = NAME` line, or a bare name). Otherwise it is the git checkout's directory name with any lab suffix (`-hlab-…`, `-dlab-…`, `-clab-…`, `-hwt<N>…`, `-dwt…`, `-cwt…`) stripped, looked up in `$TASKANIA_PROJECTS_CONF` (default `$XDG_CONFIG_HOME/taskania/projects.conf`, `~/.config` when unset; lines `name = project`), else lowercased.
 
 ## Dashboard
 

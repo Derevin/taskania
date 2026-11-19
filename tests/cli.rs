@@ -320,21 +320,36 @@ fn project_names_the_cwds_project() {
 }
 
 #[test]
-fn the_projects_conf_defaults_to_the_tasks_root() {
+fn the_projects_conf_defaults_to_the_xdg_config_dir() {
     let s = Sandbox::new();
     let lab = s.checkout("Gadget-dlab-007", None);
-    fs::write(s.tasks().join("projects.conf"), "Gadget = proj\n").unwrap();
-    let out = Command::new(BIN)
-        .arg("project")
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", s.root.join("home"))
-        .env("TASKS_ROOT", s.tasks())
-        .env_remove("TASKANIA_PROJECTS_CONF")
-        .env_remove("PWD")
-        .current_dir(&lab)
-        .output()
+    let home = s.root.join("home");
+    let xdg = s.root.join("xdg");
+    for (dir, project) in [(home.join(".config"), "proj"), (xdg.clone(), "widget")] {
+        fs::create_dir_all(dir.join("taskania")).unwrap();
+        fs::write(
+            dir.join("taskania/projects.conf"),
+            format!("Gadget = {project}\n"),
+        )
         .unwrap();
-    assert_eq!(text(&out.stdout), "proj\n", "{}", text(&out.stderr));
+    }
+    let project = |xdg_config_home: &Path| {
+        let out = Command::new(BIN)
+            .arg("project")
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("TASKS_ROOT", s.tasks())
+            .env("XDG_CONFIG_HOME", xdg_config_home)
+            .env_remove("TASKANIA_PROJECTS_CONF")
+            .env_remove("PWD")
+            .current_dir(&lab)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    assert_eq!(project(Path::new("")), "proj\n");
+    assert_eq!(project(&xdg), "widget\n");
 }
 
 // --- list ---------------------------------------------------------------------
