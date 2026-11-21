@@ -1,8 +1,8 @@
-//! Drawing. The list area: each column clipped to its
-//! width, a list taller than the body cut to `rows-1` lines and `  +N more`, a
-//! second column as wide as its longest line (at most half the pane) flush with
-//! the right edge. On top of it: the cursor, the bar, the move, priority and
-//! view prompts, the create form and the peek overlay.
+//! Drawing. The list area: each column clipped to its width, a list taller than
+//! the body cut to `rows-1` lines and `  +N (+M) more` (open tasks cut, then
+//! done and canceled), a second column as wide as its longest line (at most
+//! half the pane) flush with the right edge. On top of it: the cursor, the bar,
+//! the move, priority and view prompts, the create form and the peek overlay.
 
 use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::layout::{Position, Rect};
@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Widget};
 
 use crate::app::{App, Form, MOVES, Mode};
-use crate::listing::Task;
+use crate::listing::{Row, Task};
 
 const GUTTER: usize = 2;
 const IDLE_HINTS: [&str; 2] = ["(↑↓←→ select, n new, v view, q)", "(↑↓←→ n v q)"];
@@ -57,7 +57,7 @@ pub fn split(cols: usize, longest: usize) -> (usize, usize) {
 }
 
 /// Which rows of a column fit `height` lines: the first shown, how many, and
-/// how many the `+N more` line stands for (0: none). Without a cursor the
+/// how many rows the `+N more` line stands for (0: none). Without a cursor the
 /// column shows its top. With one it scrolls, as little as keeps the cursor
 /// in view; `offset` carries the scroll between frames.
 pub fn window(
@@ -151,11 +151,24 @@ fn render_body(area: Rect, buf: &mut Buffer, app: &mut App) {
             buf.set_stringn(
                 x,
                 area.y + shown as u16,
-                format!("  +{more} more"),
+                more_line(&column.rows[start + shown..]),
                 width,
                 Style::new(),
             );
         }
+    }
+}
+
+/// The count of the tasks among the `cut` rows: `  +N more`, or
+/// `  +N (+M) more` when M of them are done or canceled.
+fn more_line(cut: &[Row]) -> String {
+    let tasks = cut.iter().filter_map(|r| r.task.as_ref());
+    let closed = tasks.clone().filter(|t| t.status.is_closed()).count();
+    let open = tasks.count() - closed;
+    if closed == 0 {
+        format!("  +{open} more")
+    } else {
+        format!("  +{open} (+{closed}) more")
     }
 }
 
@@ -597,7 +610,14 @@ mod tests {
         let t = draw(&mut a, 40, 6);
         let got = lines(&t);
         assert_eq!(&got[..4], &PROJ.lines().take(4).collect::<Vec<_>>()[..]);
-        assert_eq!(got[4], "  +5 more");
+        assert_eq!(got[4], "  +2 (+1) more", "open tasks, then done and canceled");
+    }
+
+    #[test]
+    fn the_cut_count_drops_the_closed_part_when_none_is_cut() {
+        let (mut a, _tmp) = app(true);
+        let got = lines(&draw(&mut a, 80, 3));
+        assert!(got[1].ends_with("  +2 more"), "{got:?}");
     }
 
     #[test]
@@ -642,7 +662,7 @@ mod tests {
             got[0].starts_with("ACTIVE (1)"),
             "back to its top once the cursor leaves"
         );
-        assert!(got[4].starts_with("  +5 more"));
+        assert!(got[4].starts_with("  +2 (+1) more"));
     }
 
     #[test]
