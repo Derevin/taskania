@@ -2,7 +2,7 @@
 //! the body cut to `rows-1` lines and `  +N (+M) more` (open tasks cut, then
 //! done and canceled), a second column as wide as its longest line (at most
 //! half the pane) flush with the right edge. On top of it: the cursor, the bar,
-//! the move, priority and view prompts, the create form and the peek overlay.
+//! the move, priority and view prompts, the task form and the peek overlay.
 
 use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::layout::{Position, Rect};
@@ -16,8 +16,8 @@ use crate::listing::{Row, Task};
 const GUTTER: usize = 2;
 const IDLE_HINTS: [&str; 2] = ["(↑↓←→ select, n new, v view, q)", "(↑↓←→ n v q)"];
 const CURSOR_HINTS: [&str; 2] = [
-    "(⏎ peek, e edit, m move, p prio, n new, v view, esc)",
-    "(⏎ e m p n v esc)",
+    "(⏎ peek, e edit, m move, p prio, r rename, n new, v view, esc)",
+    "(⏎ e m p r n v esc)",
 ];
 
 /// Draw the pane. Returns where the text cursor belongs, if it shows at all.
@@ -317,15 +317,15 @@ fn status_bar(app: &App, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Two boxes on the pane's bottom rows: the priority letter and the title.
 fn render_form(area: Rect, buf: &mut Buffer, app: &App) -> Option<Position> {
     let Mode::Form(f) = &app.mode else {
         return None;
     };
     let focus = Style::new().add_modifier(Modifier::BOLD).fg(Color::Cyan);
     let border = |on: bool| if on { focus } else { Style::new() };
+    let create = f.target.is_none();
     let prio = Rect {
-        width: 6.min(area.width),
+        width: if create { 6.min(area.width) } else { 0 },
         ..area
     };
     let title = Rect {
@@ -334,30 +334,37 @@ fn render_form(area: Rect, buf: &mut Buffer, app: &App) -> Option<Position> {
         ..area
     };
 
-    let mut hints = vec!["⏎ create"];
-    if app.columns.len() > 1 {
-        hints.push("tab project");
-    }
-    hints.push("esc");
+    let (label, hints) = if let Some(task) = &f.target {
+        (format!("rename {}", task.name()), "⏎ rename, esc")
+    } else {
+        Block::bordered()
+            .title("prio")
+            .border_style(border(f.in_prio))
+            .render(prio, buf);
+        let hints = if app.columns.len() > 1 {
+            "⏎ create, tab project, esc"
+        } else {
+            "⏎ create, esc"
+        };
+        (format!("title ({})", app.columns[f.col].project), hints)
+    };
     Block::bordered()
-        .title("prio")
-        .border_style(border(f.in_prio))
-        .render(prio, buf);
-    Block::bordered()
-        .title(format!("title ({})", app.columns[f.col].project))
-        .title_bottom(Line::from(format!(" {} ", hints.join(", "))).right_aligned())
+        .title(label)
+        .title_bottom(Line::from(format!(" {hints} ")).right_aligned())
         .border_style(border(!f.in_prio))
         .render(title, buf);
-    if area.height < 3 || prio.width < 3 || title.width < 3 {
+    if area.height < 3 || title.width < 3 {
         return None;
     }
-    buf.set_stringn(
-        prio.x + 1,
-        prio.y + 1,
-        f.letter.to_string(),
-        1,
-        Style::new(),
-    );
+    if create {
+        buf.set_stringn(
+            prio.x + 1,
+            prio.y + 1,
+            f.letter.to_string(),
+            1,
+            Style::new(),
+        );
+    }
     let inner = Position::new(title.x + 1, title.y + 1);
     let (start, cursor_x) = title_window(f, (title.width - 2) as usize);
     let shown: String = f.title[start..].iter().collect();
@@ -636,7 +643,7 @@ mod tests {
         );
         assert!(!modifier(&t, 0, 3).contains(Modifier::REVERSED));
         assert!(
-            lines(&t)[11].contains("(⏎ e m p n v esc)"),
+            lines(&t)[11].contains("(⏎ e m p r n v esc)"),
             "the bar shows the row keys"
         );
     }
@@ -710,7 +717,7 @@ mod tests {
         key(&mut a, KeyCode::Down);
         assert_eq!(
             lines(&draw(&mut a, 100, 4))[3],
-            format!("{left} (⏎ peek, e edit, m move, p prio, n new, v view, esc)")
+            format!("{left} (⏎ peek, e edit, m move, p prio, r rename, n new, v view, esc)")
         );
     }
 
@@ -873,6 +880,19 @@ mod tests {
             Position::new(1, 10),
             "in the prio box"
         );
+    }
+
+    #[test]
+    fn the_rename_form_shows_one_box_with_the_task_id() {
+        let (mut a, _tmp) = app(true);
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Char('r'));
+        let mut t = draw(&mut a, 32, 12);
+        let got = lines(&t);
+        assert!(got[9].starts_with("┌rename H010─"), "{}", got[9]);
+        assert_eq!(got[10], format!("│busy{}│", " ".repeat(26)));
+        assert!(got[11].ends_with(" ⏎ rename, esc ┘"), "{}", got[11]);
+        assert_eq!(t.get_cursor_position().unwrap(), Position::new(5, 10));
     }
 
     #[test]

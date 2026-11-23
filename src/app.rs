@@ -13,7 +13,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::clock::Date;
 use crate::engine::Call;
 use crate::listing::{self, Row, Spec, Status, Task, TaskKey};
-use crate::tasks::Progress;
+use crate::tasks::{Progress, slugify};
 use crate::watch::{self, Stamp};
 
 /// How long the cursor outlives the last key.
@@ -86,6 +86,7 @@ pub struct Peek {
 
 pub struct Form {
     pub col: usize,
+    pub target: Option<Task>,
     pub letter: char,
     pub title: Vec<char>,
     pub pos: usize,
@@ -141,7 +142,7 @@ pub struct App {
     /// The running batch's progress; None until it reports, and once its
     /// results are in.
     pub progress: Option<Progress>,
-    pub pending: Vec<(usize, TaskKey)>,
+    pending: Vec<Job>,
     pub message: Option<Message>,
     /// Lines the peek shows at once, for paging; kept by the renderer.
     pub peek_rows: usize,
@@ -193,7 +194,9 @@ impl App {
     }
 
     pub fn is_pending(&self, col: usize, key: &TaskKey) -> bool {
-        self.pending.iter().any(|(c, k)| *c == col && k == key)
+        self.pending
+            .iter()
+            .any(|job| job.col == col && job.key.as_ref() == Some(key))
     }
 
     fn task_path(&self, col: usize, task: &Task) -> PathBuf {
@@ -215,17 +218,29 @@ impl App {
             verbose: false,
             ids: false,
         };
-        for column in &mut self.columns {
+        let pending_rename = self.cursor.as_ref().filter(|c| {
+            self.pending.iter().any(|job| {
+                matches!(job.call, Call::Rename { .. })
+                    && job.col == c.col
+                    && job.key.as_ref() == Some(&c.key)
+            })
+        });
+        for (col, column) in self.columns.iter_mut().enumerate() {
             let dir = self.tasks_root.join(&column.project);
-            column.rows = listing::rows(&dir, &spec).unwrap_or_else(|e| {
+            let rows = listing::rows(&dir, &spec).unwrap_or_else(|e| {
                 vec![Row {
                     text: e,
                     task: None,
                 }]
             });
+            // A poll can see the renamed file before the job reports its result.
+            if pending_rename.is_some_and(|c| c.col == col && Self::find(&rows, &c.key).is_none()) {
+                continue;
+            }
+            column.rows = rows;
         }
         if let Some(c) = self.cursor.clone() {
-            self.cursor = match self.find(c.col, &c.key) {
+            self.cursor = match Self::find(&self.columns[c.col].rows, &c.key) {
                 Some(row) => Some(Cursor { row, ..c }),
                 None => self
                     .nearest(c.col, c.row)
@@ -234,7 +249,11 @@ impl App {
         }
         // A menu belongs to the task it was opened on.
         let menu_task = match &self.mode {
-            Mode::Move(task) | Mode::Prio(task) => Some(task.key()),
+            Mode::Move(task)
+            | Mode::Prio(task)
+            | Mode::Form(Form {
+                target: Some(task), ..
+            }) => Some(task.key()),
             _ => None,
         };
         if let Some(key) = menu_task
@@ -244,8 +263,7 @@ impl App {
         }
     }
 
-    fn find(&self, col: usize, key: &TaskKey) -> Option<usize> {
-        let rows = &self.columns.get(col)?.rows;
+    fn find(rows: &[Row], key: &TaskKey) -> Option<usize> {
         rows.iter().position(|r| {
             r.task
                 .as_ref()
@@ -330,7 +348,7 @@ impl App {
             Mode::Peek(_) => self.peek_key(key.code),
             Mode::Move(_) => self.move_key(key.code),
             Mode::Prio(_) => self.prio_key(key.code, now),
-            Mode::Form(_) => self.form_key(key.code),
+            Mode::Form(_) => self.form_key(key.code, now),
             Mode::View { .. } => self.view_key(key.code),
         }
     }
@@ -351,6 +369,7 @@ impl App {
             KeyCode::Char('e') => self.open_editor(now),
             KeyCode::Char('m') => self.open_move(),
             KeyCode::Char('p') => self.open_prio(now),
+            KeyCode::Char('r') => self.open_rename(now),
             KeyCode::Char('n') => self.open_form(),
             KeyCode::Char('v') => {
                 self.mode = Mode::View {
@@ -486,9 +505,35 @@ impl App {
         let col = self.cursor.as_ref().map_or(0, |c| c.col);
         self.mode = Mode::Form(Form {
             col,
+            target: None,
             letter: 'N',
             title: vec![],
             pos: 0,
+            in_prio: false,
+        });
+        vec![]
+    }
+
+    fn open_rename(&mut self, now: Instant) -> Vec<Effect> {
+        let Some((col, task)) = self.cursor_task() else {
+            return vec![];
+        };
+        if task.status.is_closed() {
+            let text = format!(
+                "{} is {}: only an open task can be renamed",
+                task.name(),
+                task.status.dir()
+            );
+            self.info(text, now);
+            return vec![];
+        }
+        let title: Vec<char> = task.slug.chars().collect();
+        self.mode = Mode::Form(Form {
+            col,
+            target: Some(task.clone()),
+            letter: task.letter,
+            pos: title.len(),
+            title,
             in_prio: false,
         });
         vec![]
@@ -588,7 +633,7 @@ impl App {
         })
     }
 
-    fn form_key(&mut self, code: KeyCode) -> Vec<Effect> {
+    fn form_key(&mut self, code: KeyCode, now: Instant) -> Vec<Effect> {
         let columns = self.columns.len();
         let Mode::Form(f) = &mut self.mode else {
             return vec![];
@@ -601,21 +646,43 @@ impl App {
                     return vec![];
                 }
                 let (col, letter) = (f.col, f.letter);
+                let target = f.target.take();
                 self.mode = Mode::Normal;
                 let project = self.columns[col].project.clone();
-                let call = Call::Create {
-                    project,
-                    letter,
-                    title,
+                let job = if let Some(task) = target {
+                    let new_slug = slugify(&title);
+                    if task.slug == new_slug {
+                        self.info(format!("{} already has slug {new_slug}", task.name()), now);
+                        return vec![];
+                    }
+                    let done = format!("renamed {} → {new_slug}", task.slug);
+                    Job {
+                        call: Call::Rename {
+                            project,
+                            file: task.filename(),
+                            title,
+                        },
+                        col,
+                        key: Some(task.key()),
+                        done,
+                    }
+                } else {
+                    Job {
+                        call: Call::Create {
+                            project,
+                            letter,
+                            title,
+                        },
+                        col,
+                        key: None,
+                        done: String::new(),
+                    }
                 };
-                return self.queue(Job {
-                    call,
-                    col,
-                    key: None,
-                    done: String::new(),
-                });
+                return self.queue(job);
             }
-            KeyCode::Tab | KeyCode::BackTab if columns > 1 => f.col = 1 - f.col,
+            KeyCode::Tab | KeyCode::BackTab if f.target.is_none() && columns > 1 => {
+                f.col = 1 - f.col;
+            }
             KeyCode::Char(c) if f.in_prio && c.is_ascii_alphabetic() => {
                 f.letter = c.to_ascii_uppercase();
             }
@@ -637,8 +704,8 @@ impl App {
             }
             KeyCode::Home => f.pos = 0,
             KeyCode::End => f.pos = f.title.len(),
-            KeyCode::Left if f.pos == 0 => f.in_prio = true,
-            KeyCode::Left => f.pos -= 1,
+            KeyCode::Left if f.pos == 0 && f.target.is_none() => f.in_prio = true,
+            KeyCode::Left if f.pos > 0 => f.pos -= 1,
             KeyCode::Right if f.pos < f.title.len() => f.pos += 1,
             _ => {}
         }
@@ -685,8 +752,8 @@ impl App {
 
     fn queue(&mut self, job: Job) -> Vec<Effect> {
         self.in_flight += 1;
-        if let Some(key) = &job.key {
-            self.pending.push((job.col, key.clone()));
+        if job.key.is_some() {
+            self.pending.push(job.clone());
         }
         vec![Effect::Run(job)]
     }
@@ -706,24 +773,37 @@ impl App {
     ) -> Vec<Effect> {
         self.progress = None;
         self.in_flight = self.in_flight.saturating_sub(1);
-        if let Some(key) = &job.key
-            && let Some(i) = self
-                .pending
-                .iter()
-                .position(|(c, k)| *c == job.col && k == key)
-        {
+        if let Some(i) = self.pending.iter().position(|pending| *pending == job) {
             self.pending.remove(i);
         }
         match result {
             Ok(out) => {
                 let mut done = job.done;
-                if let Call::Create { .. } = job.call {
-                    let file = out
-                        .lines()
-                        .map(str::trim)
-                        .rfind(|l| !l.is_empty())
-                        .unwrap_or("");
-                    done = format!("created {}", file.strip_suffix(".md").unwrap_or(file));
+                match job.call {
+                    Call::Create { .. } => {
+                        let file = out
+                            .lines()
+                            .map(str::trim)
+                            .rfind(|l| !l.is_empty())
+                            .unwrap_or("");
+                        done = format!("created {}", file.strip_suffix(".md").unwrap_or(file));
+                    }
+                    Call::Rename { title, .. } => {
+                        let slug = slugify(&title);
+                        if let Some(c) = &mut self.cursor
+                            && c.col == job.col
+                            && job.key.as_ref() == Some(&c.key)
+                        {
+                            c.key.slug = slug.clone();
+                        }
+                        if let Mode::Peek(p) = &mut self.mode
+                            && p.col == job.col
+                            && job.key.as_ref() == Some(&p.key)
+                        {
+                            p.key.slug = slug;
+                        }
+                    }
+                    _ => {}
                 }
                 self.info(done, now);
             }
@@ -810,7 +890,7 @@ impl App {
     }
 
     /// Re-read the peeked file when it changed on disk, following the task
-    /// when a move or a reprioritize renamed it.
+    /// when a move, a reprioritize or a rename changed its filename.
     pub fn refresh_peek(&mut self) {
         let project_dir = match &self.mode {
             Mode::Peek(p) => self.tasks_root.join(&self.columns[p.col].project),
@@ -1218,6 +1298,41 @@ mod tests {
     }
 
     #[test]
+    fn the_cursor_follows_its_task_across_a_rename() {
+        let (mut a, tmp) = app(false);
+        put(tmp.path(), "proj", "todo", "N002-delta.md", "");
+        a.relist();
+        for _ in 0..3 {
+            key(&mut a, KeyCode::Down);
+        }
+        assert_eq!(a.cursor_task().unwrap().1.slug, "beta");
+        key(&mut a, KeyCode::Char('r'));
+        for _ in 0..4 {
+            key(&mut a, KeyCode::Backspace);
+        }
+        chars(&mut a, "Zeta (API)!");
+        let Some(Effect::Run(job)) = key(&mut a, KeyCode::Enter).into_iter().next() else {
+            panic!("no rename job")
+        };
+        let todo = tmp.path().join("proj/todo");
+        fs::rename(todo.join("N002-beta.md"), todo.join("N002-zeta-api.md")).unwrap();
+
+        a.relist();
+        assert_eq!(a.cursor.as_ref().unwrap().key.slug, "beta");
+        assert_eq!(
+            a.on_job_done(
+                job,
+                Ok("--- N002-beta.md -> N002-zeta-api.md (todo) ---\n".into()),
+                Instant::now(),
+            ),
+            vec![Effect::Relist]
+        );
+        a.relist();
+        assert_eq!(a.cursor_task().unwrap().1.slug, "zeta-api");
+        assert!(a.pending.is_empty());
+    }
+
+    #[test]
     fn a_cursor_whose_task_left_the_view_stays_on_its_row() {
         let (mut a, tmp) = app(false);
         for _ in 0..3 {
@@ -1428,6 +1543,129 @@ mod tests {
         key(&mut a, KeyCode::Char('p'));
         assert!(matches!(a.mode, Mode::Normal));
         assert!(a.message.as_ref().unwrap().text.contains("N050 is done"));
+    }
+
+    #[test]
+    fn rename_edits_the_slug_and_queues_in_the_tasks_project() {
+        let (mut a, _tmp) = app(true);
+        key(&mut a, KeyCode::Right);
+        let task_key = a.cursor_task().unwrap().1.key();
+        key(&mut a, KeyCode::Char('r'));
+        let Mode::Form(f) = &a.mode else {
+            panic!("no rename form")
+        };
+        assert_eq!(f.title.iter().collect::<String>(), "left-pad");
+        assert_eq!(f.pos, f.title.len());
+        key(&mut a, KeyCode::Home);
+        key(&mut a, KeyCode::Left);
+        key(&mut a, KeyCode::Tab);
+        key(&mut a, KeyCode::BackTab);
+        key(&mut a, KeyCode::Tab);
+        chars(&mut a, "New ");
+
+        assert_eq!(
+            key(&mut a, KeyCode::Enter),
+            vec![Effect::Run(Job {
+                call: Call::Rename {
+                    project: "widget".into(),
+                    file: "N007-left-pad.md".into(),
+                    title: "New left-pad".into(),
+                },
+                col: 1,
+                key: Some(task_key.clone()),
+                done: "renamed left-pad → new-left-pad".into(),
+            })]
+        );
+        assert!(matches!(a.mode, Mode::Normal));
+        assert!(a.is_pending(1, &task_key));
+    }
+
+    #[test]
+    fn rename_refuses_a_closed_task() {
+        let (mut a, _tmp) = app(false);
+        for _ in 0..5 {
+            key(&mut a, KeyCode::Down);
+        }
+        assert_eq!(key(&mut a, KeyCode::Char('r')), vec![]);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert!(a.message.as_ref().unwrap().text.contains("N050 is done"));
+    }
+
+    #[test]
+    fn an_empty_rename_waits_for_a_title() {
+        let (mut a, _tmp) = app(false);
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Char('r'));
+        for _ in 0..4 {
+            key(&mut a, KeyCode::Backspace);
+        }
+        assert_eq!(key(&mut a, KeyCode::Enter), vec![]);
+        assert!(matches!(&a.mode, Mode::Form(f) if f.title.is_empty()));
+    }
+
+    /// The cursor on N002-beta with its rename form open.
+    fn renaming_beta() -> (App, crate::testutil::TempDir) {
+        let (mut a, tmp) = app(false);
+        for _ in 0..3 {
+            key(&mut a, KeyCode::Down);
+        }
+        assert_eq!(a.cursor_task().unwrap().1.slug, "beta");
+        key(&mut a, KeyCode::Char('r'));
+        (a, tmp)
+    }
+
+    #[test]
+    fn an_unchanged_slug_renames_nothing() {
+        let (mut a, _tmp) = renaming_beta();
+        chars(&mut a, " !");
+        assert_eq!(key(&mut a, KeyCode::Enter), vec![]);
+        assert!(matches!(a.mode, Mode::Normal));
+        assert!(
+            a.message
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("already has slug beta")
+        );
+        assert_eq!(a.in_flight, 0);
+    }
+
+    #[test]
+    fn a_failed_rename_keeps_the_cursor_on_its_task() {
+        let (mut a, _tmp) = renaming_beta();
+        chars(&mut a, "-two");
+        let Some(Effect::Run(job)) = key(&mut a, KeyCode::Enter).into_iter().next() else {
+            panic!("no rename job")
+        };
+        a.on_job_done(job, Err("error: push rejected".into()), Instant::now());
+        a.relist();
+        assert!(a.pending.is_empty());
+        assert_eq!(a.cursor_task().unwrap().1.slug, "beta");
+        assert!(a.message.as_ref().unwrap().error);
+    }
+
+    #[test]
+    fn a_rename_form_closes_when_its_task_leaves() {
+        let (mut a, tmp) = renaming_beta();
+        fs::remove_file(tmp.path().join("proj/todo/N002-beta.md")).unwrap();
+        a.relist();
+        assert!(matches!(a.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn a_peek_follows_its_task_across_a_rename() {
+        let (mut a, tmp) = renaming_beta();
+        chars(&mut a, "-two");
+        let Some(Effect::Run(job)) = key(&mut a, KeyCode::Enter).into_iter().next() else {
+            panic!("no rename job")
+        };
+        key(&mut a, KeyCode::Enter);
+        let todo = tmp.path().join("proj/todo");
+        fs::rename(todo.join("N002-beta.md"), todo.join("N002-beta-two.md")).unwrap();
+        a.on_job_done(job, Ok(String::new()), Instant::now());
+        a.refresh_peek();
+        let Mode::Peek(p) = &a.mode else { panic!() };
+        assert_eq!(p.path, todo.join("N002-beta-two.md"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Taskania, the task tool: verbs that list and change tasks, and a dashboard
 //! (`--watch`) showing one or two projects' queues live, with a cursor to peek,
-//! edit, create, move and reprioritize tasks.
+//! edit, create, move, reprioritize and rename tasks.
 
 mod app;
 mod args;

@@ -27,6 +27,11 @@ pub enum Call {
         file: String,
         letter: char,
     },
+    Rename {
+        project: String,
+        file: String,
+        title: String,
+    },
     Commit {
         message: String,
     },
@@ -76,6 +81,11 @@ impl Engine {
                     file,
                     letter,
                 } => t.reprioritize(project, file, &letter.to_string()),
+                Call::Rename {
+                    project,
+                    file,
+                    title,
+                } => t.rename(project, file, title),
                 Call::Commit { message } => t.commit(message),
             })
             .collect();
@@ -131,6 +141,11 @@ mod tests {
                 file: "N002-y.md".into(),
                 letter: 'H',
             },
+            Call::Rename {
+                project: "widget".into(),
+                file: "H002-y.md".into(),
+                title: "New Y".into(),
+            },
             Call::Create {
                 project: "widget".into(),
                 letter: 'U',
@@ -142,11 +157,12 @@ mod tests {
             vec![
                 Ok("--- Moved: N001-x.md todo -> done ---\n".into()),
                 Ok("--- N002-y.md -> H002-y.md (todo) ---\n".into()),
+                Ok("--- H002-y.md -> H002-new-y.md (todo) ---\n".into()),
                 Ok("U003-fix-the-sensor.md\n".into()),
             ]
         );
         assert!(r.at("proj", "done", "N001-x.md"));
-        assert!(r.at("widget", "todo", "H002-y.md"));
+        assert!(r.at("widget", "todo", "H002-new-y.md"));
         assert!(r.at("widget", "todo", "U003-fix-the-sensor.md"));
 
         fs::write(r.root().join("proj/done/N001-x.md"), "# X, edited\n").unwrap();

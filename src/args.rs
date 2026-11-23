@@ -13,6 +13,7 @@ Verbs:
   done           complete a task: active/ -> done/
   move           move a task by hand
   reprioritize   change a task's priority letter
+  rename         change a task's slug
   create         add a reminder task to todo/
   next-id        print a project's next free task id
   commit         commit and push everything changed in the tasks repo
@@ -22,12 +23,12 @@ A change pulls the tasks repo first, then commits and pushes it.
 taskania VERB --help explains a verb; taskania --watch --help the dashboard.";
 
 pub const WATCH_HELP: &str = "\
-Taskania's dashboard: the cwd's project's tasks, live, with a cursor to peek, edit, create, move and reprioritize them.
+Taskania's dashboard: the cwd's project's tasks, live, with a cursor to peek, edit, create, move, reprioritize and rename them.
 Usage: taskania --watch [--with NAME]
 --with draws a second project's list right-aligned beside it.
 Below the open queue come done then canceled since a marker 7 days back.
 Keys: up/down move the row cursor, left/right hop to that column, esc hides it.
-On a row: enter peeks, e edits, m moves, p sets the priority. n creates a task.
+On a row: enter peeks, e edits, m moves, p sets the priority, r renames. n creates a task.
 v opens the view menu: left/right move the done-since marker, enter applies it,
 d s toggle row dates and the stale section, esc closes. q or ctrl-c quits.
 In a peek: up/down scroll, pgdn/space and pgup page, home/end jump, esc/enter/q close.";
@@ -39,7 +40,7 @@ struct Spec {
     project: bool,
 }
 
-const SPECS: [Spec; 11] = [
+const SPECS: [Spec; 12] = [
     Spec {
         name: "list",
         project: true,
@@ -99,6 +100,14 @@ Usage: taskania reprioritize [--project NAME] FILE|ID LETTER
 ID is the task's number alone, e.g. 42.",
     },
     Spec {
+        name: "rename",
+        project: true,
+        help: "\
+Set an open task's filename slug from TITLE; its id, letter and status stay.
+Usage: taskania rename [--project NAME] FILE|ID TITLE
+ID is the task's number alone, e.g. 42. Quote a multi-word title.",
+    },
+    Spec {
         name: "create",
         project: true,
         help: "\
@@ -155,6 +164,7 @@ pub enum Verb {
     Done { file: String, force: bool },
     Move { file: String, to: String },
     Reprioritize { task: String, letter: String },
+    Rename { task: String, title: String },
     Create { letter: String, title: String },
     NextId,
     Commit(String),
@@ -266,6 +276,10 @@ fn parse_verb(spec: &Spec, args: &[String]) -> Result<Parsed, String> {
         "reprioritize" => Verb::Reprioritize {
             task: need("FILE or ID")?,
             letter: need("LETTER")?,
+        },
+        "rename" => Verb::Rename {
+            task: need("FILE or ID")?,
+            title: need("TITLE")?,
         },
         "create" => {
             let title: Vec<String> = pos.by_ref().collect();
@@ -413,6 +427,13 @@ mod tests {
             Verb::Reprioritize {
                 task: "42".into(),
                 letter: "h".into()
+            }
+        );
+        assert_eq!(
+            verb(&["rename", "42", "New title"]).1,
+            Verb::Rename {
+                task: "42".into(),
+                title: "New title".into()
             }
         );
         assert_eq!(verb(&["next-id", "--project", "p"]).1, Verb::NextId);

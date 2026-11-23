@@ -272,49 +272,7 @@ impl Tasks {
         let dir = self.project_dir(project)?;
         let task = task.to_string();
         Ok(Box::new(move || {
-            let arg = Path::new(&task)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let (id, file) = (bare_id(&arg), task_filename(&arg));
-            let wanted = |name: &str| match &id {
-                Some(id) => name.ends_with(".md") && is_task_name(name) && name[1..4] == *id,
-                None => name == file,
-            };
-            let mut matches = Vec::new();
-            for status in [Todo, Planning, Planned, Active, Stale] {
-                let mut names: Vec<String> = fs::read_dir(dir.join(status.dir()))
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .filter(|e| e.path().is_file())
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .filter(|n| wanted(n))
-                    .collect();
-                names.sort();
-                matches.extend(names.into_iter().map(|n| (status, n)));
-            }
-            let (status, name) = match &matches[..] {
-                [] => {
-                    return Err(format!(
-                        "error: {task} not found in todo/, planning/, planned/, active/, or stale/"
-                    ));
-                }
-                [one] => one.clone(),
-                _ => {
-                    let names: Vec<&str> = matches.iter().map(|(_, n)| n.as_str()).collect();
-                    return Err(format!(
-                        "error: {task} matches {} tasks: {}",
-                        matches.len(),
-                        names.join(" ")
-                    ));
-                }
-            };
-            if !is_task_name(&name) {
-                return Err(format!(
-                    "error: not a <letter><NNN>-slug.md task file: {name}"
-                ));
-            }
+            let (status, name) = resolve_open_task(&dir, &task)?;
             let old = name[..1].to_string();
             if old == letter {
                 return Ok(Applied::nothing(format!(
@@ -332,6 +290,43 @@ impl Tasks {
             fs::rename(here.join(&name), here.join(&new_name)).map_err(io_error)?;
             Ok(Applied::commit(
                 format!("Reprioritize: {} {old}->{letter}", slug(&name)),
+                move || format!("--- {name} -> {new_name} ({}) ---\n", status.dir()),
+            ))
+        }))
+    }
+
+    /// Rewrite an open task's slug. `task` is its filename or bare id.
+    pub fn rename(&self, project: &str, task: &str, title: &str) -> Change {
+        let new_slug = slugify(title);
+        if new_slug.is_empty() {
+            return Err("error: title has no alphanumeric characters to slug".into());
+        }
+        let dir = self.project_dir(project)?;
+        let task = task.to_string();
+        Ok(Box::new(move || {
+            let (status, name) = resolve_open_task(&dir, &task)?;
+            let old_slug = slug(&name);
+            if old_slug == new_slug {
+                return Ok(Applied::nothing(format!(
+                    "{name} already has slug {new_slug}\n"
+                )));
+            }
+            let new_name = format!("{}-{new_slug}.md", &name[..4]);
+            let here = dir.join(status.dir());
+            let target = here.join(&new_name);
+            match target.symlink_metadata() {
+                Ok(_) => {
+                    return Err(format!(
+                        "error: {new_name} already exists in {}/ (duplicate ID?)",
+                        status.dir()
+                    ));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_error(e)),
+            }
+            fs::rename(here.join(&name), target).map_err(io_error)?;
+            Ok(Applied::commit(
+                format!("Rename: {old_slug}->{new_slug}"),
                 move || format!("--- {name} -> {new_name} ({}) ---\n", status.dir()),
             ))
         }))
@@ -483,6 +478,53 @@ fn is_letter(s: &str) -> bool {
 fn bare_id(arg: &str) -> Option<String> {
     let ok = (1..=3).contains(&arg.len()) && arg.bytes().all(|b| b.is_ascii_digit());
     ok.then(|| format!("{:03}", arg.parse::<u32>().unwrap_or(0)))
+}
+
+fn resolve_open_task(dir: &Path, task: &str) -> Result<(Status, String), String> {
+    let arg = Path::new(task)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (id, file) = (bare_id(&arg), task_filename(&arg));
+    let wanted = |name: &str| match &id {
+        Some(id) => name.ends_with(".md") && is_task_name(name) && name[1..4] == *id,
+        None => name == file,
+    };
+    let mut matches = Vec::new();
+    for status in [Todo, Planning, Planned, Active, Stale] {
+        let mut names: Vec<String> = fs::read_dir(dir.join(status.dir()))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| wanted(n))
+            .collect();
+        names.sort();
+        matches.extend(names.into_iter().map(|n| (status, n)));
+    }
+    let (status, name) = match &matches[..] {
+        [] => {
+            return Err(format!(
+                "error: {task} not found in todo/, planning/, planned/, active/, or stale/"
+            ));
+        }
+        [one] => one.clone(),
+        _ => {
+            let names: Vec<&str> = matches.iter().map(|(_, n)| n.as_str()).collect();
+            return Err(format!(
+                "error: {task} matches {} tasks: {}",
+                matches.len(),
+                names.join(" ")
+            ));
+        }
+    };
+    if !is_task_name(&name) {
+        return Err(format!(
+            "error: not a <letter><NNN>-slug.md task file: {name}"
+        ));
+    }
+    Ok((status, name))
 }
 
 /// Lowercased, every run of anything but `a-z0-9` one hyphen, none at the ends.

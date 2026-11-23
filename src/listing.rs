@@ -81,15 +81,14 @@ impl Status {
         self.move_refusal(to).is_none()
     }
 
-    /// Done and canceled: the statuses a reprioritize does not look in.
+    /// Done and canceled: the statuses a reprioritize or rename does not look in.
     pub fn is_closed(self) -> bool {
         matches!(self, Status::Done | Status::Canceled)
     }
 }
 
-/// A task's identity across refreshes: the id and slug survive a
-/// reprioritize, which rewrites only the letter, and a move, which only
-/// changes the directory.
+/// A task's identity across refreshes: survives a move or reprioritize, not
+/// a rename.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TaskKey {
     pub id: String,

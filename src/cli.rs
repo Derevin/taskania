@@ -19,6 +19,7 @@ pub fn run(ctx: &Ctx, project: Option<String>, verb: Verb) -> Result<String, Str
         Verb::Done { file, force } => tasks.done(&project()?, &file, force),
         Verb::Move { file, to } => tasks.move_task(&project()?, &file, &to),
         Verb::Reprioritize { task, letter } => tasks.reprioritize(&project()?, &task, &letter),
+        Verb::Rename { task, title } => tasks.rename(&project()?, &task, &title),
         // A project named by hand must exist: a typo must not start a new one.
         Verb::Create { letter, title } => tasks.create(&project()?, !explicit, &letter, &title),
         Verb::Commit(message) => tasks.commit(&message),

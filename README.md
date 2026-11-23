@@ -1,6 +1,6 @@
 # taskania
 
-Task tool for a markdown task queue kept in git. Its verbs list and change tasks; its dashboard shows one project's tasks live, optionally a second project's beside them, and lets you peek into a task, edit it, create one, move it between statuses and change its priority.
+Task tool for a markdown task queue kept in git. Its verbs list and change tasks. Its dashboard shows up to two projects live and lets you peek into, edit, create, move, reprioritize and rename tasks.
 
 Tasks are files under `$TASKS_ROOT` (default `~/repos/tasks`), a git repo with a remote: `<project>/<status>/<Letter><NNN>-<slug>.md`, where the status is one of `todo planning planned active stale done canceled`, the letter a priority and `NNN` the task's id. Every change pulls the repo first, then commits and pushes it. Taskania needs `git` and nothing else.
 
@@ -28,6 +28,7 @@ taskania unclaim FILE             planning -> todo; active -> planned
 taskania done [--force] FILE      active -> done; --force from any status
 taskania move FILE STATUS         by hand: into todo, planned, done or canceled; into stale only from active
 taskania reprioritize FILE|ID LETTER
+taskania rename FILE|ID TITLE      set an open task's filename slug
 taskania create [-p LETTER] TITLE...
 taskania next-id
 taskania commit MESSAGE           commit and push everything changed in the tasks repo
@@ -55,6 +56,7 @@ Shows the current directory's project; `--with` adds a second project's list, ri
 | `e` | edit the task file in `$VISUAL` or `$EDITOR`, then commit it |
 | `m` | move: `t` todo, `p` planned, `s` stale, `d` done, `c` canceled |
 | `p` | set the priority letter, A to Z |
+| `r` | rename an open task by editing its filename slug |
 | `n` | create a task: a priority letter and a title |
 | `v` | view menu: `←` `→` move the done window's start a day, `Enter` applies it; `d` `s` toggle row dates, the stale section; `Esc` closes |
 | `q` `Ctrl-C` | quit |

@@ -180,7 +180,7 @@ fn age(path: &Path, days: u64) {
         .unwrap();
 }
 
-const VERBS: [&str; 11] = [
+const VERBS: [&str; 12] = [
     "list",
     "claim",
     "planned",
@@ -188,6 +188,7 @@ const VERBS: [&str; 11] = [
     "done",
     "move",
     "reprioritize",
+    "rename",
     "create",
     "next-id",
     "commit",
@@ -717,6 +718,89 @@ fn reprioritize_refuses_bad_letters_and_ambiguous_or_closed_tasks() {
     s.seed("todo", "notes.md", "");
     assert_eq!(
         s.refused(&["reprioritize", "notes", "H"]),
+        "error: not a <letter><NNN>-slug.md task file: notes.md"
+    );
+}
+
+// --- rename -------------------------------------------------------------------
+
+#[test]
+fn rename_rewrites_the_slug_by_filename_or_id() {
+    let s = Sandbox::new();
+    let body = "# A\n\nKeep this text.\n";
+    s.seed("planned", "H007-a.md", body);
+    assert_eq!(
+        s.ok(&["rename", "path/to/H007-a.md", "B!"]),
+        "--- H007-a.md -> H007-b.md (planned) ---\n"
+    );
+    assert!(!s.at("planned", "H007-a.md"));
+    assert_eq!(s.body("planned", "H007-b.md"), body);
+    assert_eq!(s.subject(), "Rename: a->b");
+    assert!(s.pushed());
+
+    assert_eq!(
+        s.ok(&["rename", "7", "New (API) title"]),
+        "--- H007-b.md -> H007-new-api-title.md (planned) ---\n"
+    );
+    assert!(!s.at("planned", "H007-b.md"));
+    assert_eq!(s.body("planned", "H007-new-api-title.md"), body);
+    assert_eq!(s.subject(), "Rename: b->new-api-title");
+    assert!(s.pushed());
+}
+
+#[test]
+fn rename_with_an_unchanged_slug_is_a_no_op() {
+    let s = Sandbox::new();
+    s.seed("stale", "N001-a.md", "body");
+    let before = s.head();
+    assert_eq!(
+        s.ok(&["rename", "N001-a", "A!"]),
+        "N001-a.md already has slug a\n"
+    );
+    assert_eq!(s.head(), before);
+    assert_eq!(s.body("stale", "N001-a.md"), "body");
+}
+
+#[test]
+fn rename_refuses_an_empty_slug_or_an_existing_target() {
+    let s = Sandbox::new();
+    s.seed("todo", "N001-a.md", "source");
+    s.seed("todo", "N001-b.md", "target");
+    for title in ["", "  ", "?!"] {
+        assert_eq!(
+            s.refused(&["rename", "N001-a", title]),
+            "error: title has no alphanumeric characters to slug"
+        );
+    }
+    assert_eq!(
+        s.refused(&["rename", "N001-a", "b"]),
+        "error: N001-b.md already exists in todo/ (duplicate ID?)"
+    );
+    assert_eq!(s.body("todo", "N001-a.md"), "source");
+    assert_eq!(s.body("todo", "N001-b.md"), "target");
+}
+
+#[test]
+fn rename_refuses_closed_ambiguous_missing_and_invalid_tasks() {
+    let s = Sandbox::new();
+    s.seed("todo", "N001-a.md", "");
+    s.seed("active", "H001-b.md", "");
+    s.seed("done", "N002-c.md", "");
+    s.seed("canceled", "N003-d.md", "");
+    s.seed("todo", "notes.md", "");
+
+    for task in ["N002-c", "3", "999"] {
+        assert_eq!(
+            s.refused(&["rename", task, "new"]),
+            format!("error: {task} not found in todo/, planning/, planned/, active/, or stale/")
+        );
+    }
+    assert_eq!(
+        s.refused(&["rename", "1", "new"]),
+        "error: 1 matches 2 tasks: N001-a.md H001-b.md"
+    );
+    assert_eq!(
+        s.refused(&["rename", "notes", "new"]),
         "error: not a <letter><NNN>-slug.md task file: notes.md"
     );
 }
