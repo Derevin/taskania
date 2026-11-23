@@ -439,8 +439,8 @@ mod tests {
             })
             .collect();
         let mut want: Vec<String> = (0..=7).map(|n| format!("{n}/7")).collect();
-        want.push(r#"Ok("N001-one.md\n")"#.into());
-        want.push(r#"Ok("N002-two.md\n")"#.into());
+        want.push(r#"Ok("--- Created: proj/N001-one.md ---\n")"#.into());
+        want.push(r#"Ok("--- Created: proj/N002-two.md ---\n")"#.into());
         assert_eq!(got, want);
         assert_eq!(r.pushes(), 1);
     }

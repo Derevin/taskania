@@ -134,6 +134,7 @@ impl Tasks {
     pub fn claim(&self, project: &str, file: &str) -> Change {
         let file = task_filename(file);
         let dir = self.project_dir(project)?;
+        let project = project.to_string();
         Ok(Box::new(move || {
             let (from, to) = [(Todo, Planning), (Planned, Active), (Stale, Active)]
                 .into_iter()
@@ -145,7 +146,7 @@ impl Tasks {
                 format!("Claim: {}", slug(&file)),
                 move || {
                     let body = fs::read_to_string(&dst).unwrap_or_default();
-                    format!("--- Claimed: {file} ---\n\n{body}")
+                    format!("--- Claimed: {project}/{file} ---\n\n{body}")
                 },
             ))
         }))
@@ -155,6 +156,7 @@ impl Tasks {
     pub fn planned(&self, project: &str, file: &str) -> Change {
         let file = task_filename(file);
         let dir = self.project_dir(project)?;
+        let project = project.to_string();
         Ok(Box::new(move || {
             let src = dir.join(Planning.dir()).join(&file);
             if !src.is_file() {
@@ -163,7 +165,7 @@ impl Tasks {
             relocate(&dir, &file, Planning, Planned).map_err(io_error)?;
             Ok(Applied::commit(
                 format!("Plan: {}", slug(&file)),
-                String::new,
+                move || format!("--- Planned: {project}/{file} ---\n"),
             ))
         }))
     }
@@ -172,6 +174,7 @@ impl Tasks {
     pub fn unclaim(&self, project: &str, file: &str) -> Change {
         let file = task_filename(file);
         let dir = self.project_dir(project)?;
+        let project = project.to_string();
         Ok(Box::new(move || {
             let (from, to) = [(Planning, Todo), (Active, Planned)]
                 .into_iter()
@@ -180,7 +183,7 @@ impl Tasks {
             relocate(&dir, &file, from, to).map_err(io_error)?;
             Ok(Applied::commit(
                 format!("Unclaim: {}", slug(&file)),
-                move || format!("--- Unclaimed: {file} ---\n"),
+                move || format!("--- Unclaimed: {project}/{file} ---\n"),
             ))
         }))
     }
@@ -189,6 +192,7 @@ impl Tasks {
     pub fn done(&self, project: &str, file: &str, force: bool) -> Change {
         let file = task_filename(file);
         let dir = self.project_dir(project)?;
+        let project = project.to_string();
         Ok(Box::new(move || {
             let from = if force {
                 [Active, Planned, Planning, Stale, Todo, Canceled]
@@ -205,7 +209,7 @@ impl Tasks {
             relocate(&dir, &file, from, Done).map_err(io_error)?;
             Ok(Applied::commit(
                 format!("Done: {}", slug(&file)),
-                String::new,
+                move || format!("--- Done: {project}/{file} ---\n"),
             ))
         }))
     }
@@ -256,7 +260,7 @@ impl Tasks {
             relocate(&dir, &file, from, to).map_err(io_error)?;
             Ok(Applied::commit(
                 format!("Move: {} {f}->{t}", slug(&file)),
-                move || format!("--- Moved: {file} {f} -> {t} ---\n"),
+                move || format!("--- Moved: {project}/{file} {f} -> {t} ---\n"),
             ))
         }))
     }
@@ -270,13 +274,14 @@ impl Tasks {
             );
         }
         let dir = self.project_dir(project)?;
+        let project = project.to_string();
         let task = task.to_string();
         Ok(Box::new(move || {
             let (status, name) = resolve_open_task(&dir, &task)?;
             let old = name[..1].to_string();
             if old == letter {
                 return Ok(Applied::nothing(format!(
-                    "{name} already at priority {letter}\n"
+                    "{project}/{name} already at priority {letter}\n"
                 )));
             }
             let new_name = format!("{letter}{}", &name[1..]);
@@ -290,7 +295,12 @@ impl Tasks {
             fs::rename(here.join(&name), here.join(&new_name)).map_err(io_error)?;
             Ok(Applied::commit(
                 format!("Reprioritize: {} {old}->{letter}", slug(&name)),
-                move || format!("--- {name} -> {new_name} ({}) ---\n", status.dir()),
+                move || {
+                    format!(
+                        "--- {project}/{name} -> {new_name} ({}) ---\n",
+                        status.dir()
+                    )
+                },
             ))
         }))
     }
@@ -302,13 +312,14 @@ impl Tasks {
             return Err("error: title has no alphanumeric characters to slug".into());
         }
         let dir = self.project_dir(project)?;
+        let project = project.to_string();
         let task = task.to_string();
         Ok(Box::new(move || {
             let (status, name) = resolve_open_task(&dir, &task)?;
             let old_slug = slug(&name);
             if old_slug == new_slug {
                 return Ok(Applied::nothing(format!(
-                    "{name} already has slug {new_slug}\n"
+                    "{project}/{name} already has slug {new_slug}\n"
                 )));
             }
             let new_name = format!("{}-{new_slug}.md", &name[..4]);
@@ -327,12 +338,17 @@ impl Tasks {
             fs::rename(here.join(&name), target).map_err(io_error)?;
             Ok(Applied::commit(
                 format!("Rename: {old_slug}->{new_slug}"),
-                move || format!("--- {name} -> {new_name} ({}) ---\n", status.dir()),
+                move || {
+                    format!(
+                        "--- {project}/{name} -> {new_name} ({}) ---\n",
+                        status.dir()
+                    )
+                },
             ))
         }))
     }
 
-    /// An empty reminder task in todo/, named by `title`. Prints its filename.
+    /// An empty reminder task in todo/, named by `title`. Prints its project and filename.
     /// `make` creates the project when it has none yet.
     pub fn create(&self, project: &str, make: bool, letter: &str, title: &str) -> Change {
         let letter = letter.to_uppercase();
@@ -351,6 +367,7 @@ impl Tasks {
         } else {
             self.project_dir(project)?
         };
+        let project = project.to_string();
         Ok(Box::new(move || {
             for s in Status::ALL {
                 fs::create_dir_all(dir.join(s.dir())).map_err(io_error)?;
@@ -359,7 +376,7 @@ impl Tasks {
             let file = format!("{letter}{}-{slug}.md", next_id(&dir));
             fs::write(dir.join(Todo.dir()).join(&file), "").map_err(io_error)?;
             Ok(Applied::commit(format!("Add: {slug}"), move || {
-                format!("{file}\n")
+                format!("--- Created: {project}/{file} ---\n")
             }))
         }))
     }
@@ -589,7 +606,10 @@ mod tests {
         let (results, seen) = publish(&t, batch);
         assert_eq!(
             results,
-            vec![Ok("N002-one.md\n".into()), Ok("H003-two.md\n".into())]
+            vec![
+                Ok("--- Created: proj/N002-one.md ---\n".into()),
+                Ok("--- Created: proj/H003-two.md ---\n".into()),
+            ]
         );
         assert_eq!(r.subjects(2), ["Add: two", "Add: one"]);
         assert!(r.pushed());
@@ -603,7 +623,10 @@ mod tests {
         let r = TasksRepo::new(&["proj"]);
         let t = Tasks::new(r.root());
         let (results, seen) = publish(&t, vec![t.create("proj", false, "N", "one")]);
-        assert_eq!(results, vec![Ok("N001-one.md\n".into())]);
+        assert_eq!(
+            results,
+            vec![Ok("--- Created: proj/N001-one.md ---\n".into())]
+        );
         assert_eq!(seen, counted(5));
     }
 
@@ -629,14 +652,14 @@ mod tests {
         assert_eq!(
             results,
             vec![
-                Ok("N001-one.md\n".into()),
+                Ok("--- Created: proj/N001-one.md ---\n".into()),
                 Err("error: N404-gone.md not found in proj".into()),
                 Err(String::new()),
                 Err(
                     "error: priority must be a single letter A-Z (see ~/repos/tasks/CLAUDE.md)"
                         .into()
                 ),
-                Ok("N002-two.md\n".into()),
+                Ok("--- Created: proj/N002-two.md ---\n".into()),
             ]
         );
         assert_eq!(r.subjects(2), ["Add: two", "Add: one"]);
@@ -671,7 +694,7 @@ mod tests {
             results,
             vec![
                 Err(refused.clone()),
-                Ok("N001-x.md already at priority N\n".into()),
+                Ok("proj/N001-x.md already at priority N\n".into()),
                 Err("error: title has no alphanumeric characters to slug".into()),
                 Err(refused),
             ]
@@ -740,7 +763,7 @@ mod tests {
         let (results, seen) = publish(&t, vec![t.reprioritize("proj", "1", "n")]);
         assert_eq!(
             results,
-            vec![Ok("N001-x.md already at priority N\n".into())]
+            vec![Ok("proj/N001-x.md already at priority N\n".into())]
         );
         assert_eq!(seen, ["0/5", "1/5", "1/3", "1/1"]);
         assert_eq!(r.subjects(1), ["seed N001-x.md"]);

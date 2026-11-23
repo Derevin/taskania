@@ -111,7 +111,7 @@ ID is the task's number alone, e.g. 42. Quote a multi-word title.",
         name: "create",
         project: true,
         help: "\
-Create a reminder task: an empty file in todo/, named by the title. Prints its filename.
+Create a reminder task: an empty file in todo/, named by the title. Prints its project and filename.
 Usage: taskania create [--project NAME] [-p LETTER] TITLE...
 -p sets the priority letter (default N). The cwd's project is made if it has no tasks yet;
 a --project one must exist.",

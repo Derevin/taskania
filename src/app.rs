@@ -781,12 +781,15 @@ impl App {
                 let mut done = job.done;
                 match job.call {
                     Call::Create { .. } => {
-                        let file = out
-                            .lines()
-                            .map(str::trim)
-                            .rfind(|l| !l.is_empty())
+                        // Keyed on the `project/file.md` token alone, so the banner's
+                        // wording can change without blanking this message.
+                        let name = out
+                            .split_whitespace()
+                            .rfind(|w| w.ends_with(".md"))
+                            .map(|w| w.rsplit('/').next().unwrap_or(w))
+                            .map(|f| f.strip_suffix(".md").unwrap_or(f))
                             .unwrap_or("");
-                        done = format!("created {}", file.strip_suffix(".md").unwrap_or(file));
+                        done = format!("created {name}");
                     }
                     Call::Rename { title, .. } => {
                         let slug = slugify(&title);
@@ -1816,7 +1819,11 @@ mod tests {
         let Some(Effect::Run(job)) = key(&mut a, KeyCode::Enter).into_iter().next() else {
             panic!()
         };
-        a.on_job_done(job, Ok("A009-new-one.md\n".into()), Instant::now());
+        a.on_job_done(
+            job,
+            Ok("--- Created: proj/A009-new-one.md ---\n".into()),
+            Instant::now(),
+        );
         assert_eq!(a.message.as_ref().unwrap().text, "created A009-new-one");
         put(tmp.path(), "proj", "todo", "A009-new-one.md", "");
         a.relist();

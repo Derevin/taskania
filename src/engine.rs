@@ -155,10 +155,10 @@ mod tests {
         assert_eq!(
             e.run(&calls, &|_| {}),
             vec![
-                Ok("--- Moved: N001-x.md todo -> done ---\n".into()),
-                Ok("--- N002-y.md -> H002-y.md (todo) ---\n".into()),
-                Ok("--- H002-y.md -> H002-new-y.md (todo) ---\n".into()),
-                Ok("U003-fix-the-sensor.md\n".into()),
+                Ok("--- Moved: proj/N001-x.md todo -> done ---\n".into()),
+                Ok("--- widget/N002-y.md -> H002-y.md (todo) ---\n".into()),
+                Ok("--- widget/H002-y.md -> H002-new-y.md (todo) ---\n".into()),
+                Ok("--- Created: widget/U003-fix-the-sensor.md ---\n".into()),
             ]
         );
         assert!(r.at("proj", "done", "N001-x.md"));

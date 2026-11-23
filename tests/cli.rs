@@ -452,7 +452,10 @@ fn claim_takes_todo_to_planning_and_planned_or_stale_to_active() {
     let s = Sandbox::new();
     s.seed("todo", "N001-raw.md", "# Raw\n\nbody\n");
     let out = s.ok(&["claim", "N001-raw"]);
-    assert_eq!(out, "--- Claimed: N001-raw.md ---\n\n# Raw\n\nbody\n");
+    assert_eq!(
+        out,
+        "--- Claimed: widget/N001-raw.md ---\n\n# Raw\n\nbody\n"
+    );
     assert!(s.at("planning", "N001-raw.md") && !s.at("todo", "N001-raw.md"));
     assert_eq!(
         s.body("planning", "N001-raw.md"),
@@ -486,7 +489,10 @@ fn claim_takes_todo_to_planning_and_planned_or_stale_to_active() {
 fn planned_parks_a_planning_task() {
     let s = Sandbox::new();
     s.seed("planning", "N001-grilled.md", "# G\nWorker: hlab-1\n");
-    assert_eq!(s.ok(&["planned", "N001-grilled"]), "");
+    assert_eq!(
+        s.ok(&["planned", "N001-grilled"]),
+        "--- Planned: widget/N001-grilled.md ---\n"
+    );
     assert_eq!(
         s.body("planned", "N001-grilled.md"),
         "# G\nWorker: hlab-1\n"
@@ -506,7 +512,7 @@ fn unclaim_returns_a_claim_where_it_came_from() {
     s.seed("planning", "N001-mid-grill.md", "");
     assert_eq!(
         s.ok(&["unclaim", "N001-mid-grill"]),
-        "--- Unclaimed: N001-mid-grill.md ---\n"
+        "--- Unclaimed: widget/N001-mid-grill.md ---\n"
     );
     assert!(s.at("todo", "N001-mid-grill.md"));
     assert_eq!(s.subject(), "Unclaim: mid-grill");
@@ -526,7 +532,10 @@ fn unclaim_returns_a_claim_where_it_came_from() {
 fn done_completes_an_active_task_or_any_with_force() {
     let s = Sandbox::new();
     s.seed("active", "N001-built.md", "");
-    assert_eq!(s.ok(&["done", "N001-built"]), "");
+    assert_eq!(
+        s.ok(&["done", "N001-built"]),
+        "--- Done: widget/N001-built.md ---\n"
+    );
     assert!(s.at("done", "N001-built.md"));
     assert_eq!(s.subject(), "Done: built");
     assert!(s.pushed());
@@ -545,7 +554,10 @@ fn done_completes_an_active_task_or_any_with_force() {
     {
         let file = format!("N1{n:02}-forced.md");
         s.seed(status, &file, "");
-        s.ok(&["done", "--force", &file]);
+        assert_eq!(
+            s.ok(&["done", "--force", &file]),
+            format!("--- Done: widget/{file} ---\n")
+        );
         assert!(s.at("done", &file), "--force from {status}");
     }
     assert_eq!(
@@ -577,7 +589,10 @@ fn move_lands_every_legal_target() {
             let file = format!("N{n:03}-task-{n}.md");
             s.seed(from, &file, "# T\nWorker: hlab-5\n");
             let out = s.ok(&["move", file.strip_suffix(".md").unwrap(), to]);
-            assert_eq!(out, format!("--- Moved: {file} {from} -> {to} ---\n"));
+            assert_eq!(
+                out,
+                format!("--- Moved: widget/{file} {from} -> {to} ---\n")
+            );
             assert!(s.at(to, &file) && !s.at(from, &file), "{from} -> {to}");
             assert_eq!(s.subject(), format!("Move: task-{n} {from}->{to}"));
             assert_eq!(s.body(to, &file), "# T\nWorker: hlab-5\n", "{from} -> {to}");
@@ -652,6 +667,10 @@ fn project_flag_acts_from_anywhere_and_must_name_a_project() {
         &["move", "--project", "proj", "N001-far", "done"],
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "--- Moved: proj/N001-far.md todo -> done ---\n"
+    );
     assert!(s.tasks().join("proj/done/N001-far.md").is_file());
 
     s.seed("todo", "N002-here.md", "");
@@ -672,7 +691,7 @@ fn reprioritize_rewrites_the_letter_by_filename_or_id() {
     s.seed("planned", "N007-api.md", "");
     assert_eq!(
         s.ok(&["reprioritize", "N007-api", "h"]),
-        "--- N007-api.md -> H007-api.md (planned) ---\n"
+        "--- widget/N007-api.md -> H007-api.md (planned) ---\n"
     );
     assert!(s.at("planned", "H007-api.md"));
     assert_eq!(s.subject(), "Reprioritize: api N->H");
@@ -686,7 +705,7 @@ fn reprioritize_rewrites_the_letter_by_filename_or_id() {
     let before = s.head();
     assert_eq!(
         s.ok(&["reprioritize", "007", "A"]),
-        "A007-api.md already at priority A\n"
+        "widget/A007-api.md already at priority A\n"
     );
     assert_eq!(s.head(), before);
 }
@@ -731,7 +750,7 @@ fn rename_rewrites_the_slug_by_filename_or_id() {
     s.seed("planned", "H007-a.md", body);
     assert_eq!(
         s.ok(&["rename", "path/to/H007-a.md", "B!"]),
-        "--- H007-a.md -> H007-b.md (planned) ---\n"
+        "--- widget/H007-a.md -> H007-b.md (planned) ---\n"
     );
     assert!(!s.at("planned", "H007-a.md"));
     assert_eq!(s.body("planned", "H007-b.md"), body);
@@ -740,7 +759,7 @@ fn rename_rewrites_the_slug_by_filename_or_id() {
 
     assert_eq!(
         s.ok(&["rename", "7", "New (API) title"]),
-        "--- H007-b.md -> H007-new-api-title.md (planned) ---\n"
+        "--- widget/H007-b.md -> H007-new-api-title.md (planned) ---\n"
     );
     assert!(!s.at("planned", "H007-b.md"));
     assert_eq!(s.body("planned", "H007-new-api-title.md"), body);
@@ -755,7 +774,7 @@ fn rename_with_an_unchanged_slug_is_a_no_op() {
     let before = s.head();
     assert_eq!(
         s.ok(&["rename", "N001-a", "A!"]),
-        "N001-a.md already has slug a\n"
+        "widget/N001-a.md already has slug a\n"
     );
     assert_eq!(s.head(), before);
     assert_eq!(s.body("stale", "N001-a.md"), "body");
@@ -812,7 +831,7 @@ fn create_adds_an_empty_task_named_by_the_title() {
     let s = Sandbox::new();
     assert_eq!(
         s.ok(&["create", "Fix the thing"]),
-        "N001-fix-the-thing.md\n"
+        "--- Created: widget/N001-fix-the-thing.md ---\n"
     );
     assert_eq!(s.body("todo", "N001-fix-the-thing.md"), "");
     assert_eq!(s.subject(), "Add: fix-the-thing");
@@ -867,6 +886,7 @@ fn create_makes_the_cwds_project_but_not_a_named_one() {
     let fresh = s.checkout("fresh", None);
     let out = s.run_in(&fresh, &["create", "first"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "--- Created: fresh/N001-first.md ---\n");
     assert!(s.tasks().join("fresh/todo/N001-first.md").is_file());
     assert!(s.tasks().join("fresh/stale").is_dir());
 
@@ -874,7 +894,10 @@ fn create_makes_the_cwds_project_but_not_a_named_one() {
         &s.root.join("elsewhere"),
         &["create", "--project", "proj", "from afar"],
     );
-    assert_eq!(text(&out.stdout), "N001-from-afar.md\n");
+    assert_eq!(
+        text(&out.stdout),
+        "--- Created: proj/N001-from-afar.md ---\n"
+    );
     assert!(s.tasks().join("proj/todo/N001-from-afar.md").is_file());
 }
 
