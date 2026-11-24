@@ -95,17 +95,6 @@ pub struct TaskKey {
     pub slug: String,
 }
 
-impl TaskKey {
-    /// From a task filename, `<Letter><NNN>-<slug>[.md]`.
-    pub fn from_filename(name: &str) -> Option<TaskKey> {
-        let (_, id, slug) = split_filename(name)?;
-        Some(TaskKey {
-            id: id.to_string(),
-            slug: slug.to_string(),
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Task {
     pub status: Status,
@@ -543,30 +532,5 @@ mod tests {
         assert_eq!(Active.move_refusal(Active), Some(Refusal::Claim));
         assert_eq!(Todo.move_refusal(Todo), Some(Refusal::Same));
         assert_eq!(Todo.move_refusal(Stale), Some(Refusal::NotActive));
-    }
-
-    #[test]
-    fn a_key_comes_from_a_filename() {
-        let key = TaskKey::from_filename("N050-fix-the-sensor.md").unwrap();
-        assert_eq!(
-            (key.id.as_str(), key.slug.as_str()),
-            ("050", "fix-the-sensor")
-        );
-        assert_eq!(
-            TaskKey::from_filename("N050-x"),
-            Some(TaskKey {
-                id: "050".into(),
-                slug: "x".into()
-            })
-        );
-        for bad in [
-            "notes.md",
-            "N050-.md",
-            "n050-x.md",
-            "N05-x.md",
-            "N0500-x.md",
-        ] {
-            assert_eq!(TaskKey::from_filename(bad), None, "{bad}");
-        }
     }
 }

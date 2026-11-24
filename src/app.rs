@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,6 @@ use crate::clock::Date;
 use crate::engine::Call;
 use crate::listing::{self, Row, Spec, Status, Task, TaskKey};
 use crate::tasks::{Progress, slugify};
-use crate::watch::{self, Stamp};
 
 /// How long the cursor outlives the last key.
 pub const CURSOR_TIMEOUT: Duration = Duration::from_secs(60);
@@ -64,7 +63,6 @@ pub struct Cursor {
 
 pub enum Mode {
     Normal,
-    Peek(Peek),
     Move(Task),
     Prio(Task),
     Form(Form),
@@ -72,16 +70,6 @@ pub enum Mode {
     View {
         recent: u32,
     },
-}
-
-pub struct Peek {
-    pub col: usize,
-    pub key: TaskKey,
-    pub path: PathBuf,
-    /// None once the file is gone and could not be found again.
-    pub text: Option<String>,
-    pub stamp: Option<Stamp>,
-    pub scroll: usize,
 }
 
 pub struct Form {
@@ -144,8 +132,6 @@ pub struct App {
     pub progress: Option<Progress>,
     pending: Vec<Job>,
     pub message: Option<Message>,
-    /// Lines the peek shows at once, for paging; kept by the renderer.
-    pub peek_rows: usize,
     last_key: Instant,
 }
 
@@ -175,7 +161,6 @@ impl App {
             progress: None,
             pending: vec![],
             message: None,
-            peek_rows: 20,
             last_key: now,
         }
     }
@@ -345,7 +330,6 @@ impl App {
         }
         match self.mode {
             Mode::Normal => self.normal_key(key.code, now),
-            Mode::Peek(_) => self.peek_key(key.code),
             Mode::Move(_) => self.move_key(key.code),
             Mode::Prio(_) => self.prio_key(key.code, now),
             Mode::Form(_) => self.form_key(key.code, now),
@@ -365,8 +349,7 @@ impl App {
                 self.message = None;
                 vec![]
             }
-            KeyCode::Enter => self.open_peek(),
-            KeyCode::Char('e') => self.open_editor(now),
+            KeyCode::Enter => self.open_editor(now),
             KeyCode::Char('m') => self.open_move(),
             KeyCode::Char('p') => self.open_prio(now),
             KeyCode::Char('r') => self.open_rename(now),
@@ -434,22 +417,6 @@ impl App {
             self.columns[c.col].offset = 0;
             self.cursor = Some(self.cursor_at(to, row));
         }
-        vec![]
-    }
-
-    fn open_peek(&mut self) -> Vec<Effect> {
-        let Some((col, task)) = self.cursor_task() else {
-            return vec![];
-        };
-        let (key, path) = (task.key(), self.task_path(col, task));
-        self.mode = Mode::Peek(Peek {
-            col,
-            key,
-            text: fs::read_to_string(&path).ok(),
-            stamp: watch::stamp(&path),
-            path,
-            scroll: 0,
-        });
         vec![]
     }
 
@@ -536,24 +503,6 @@ impl App {
             title,
             in_prio: false,
         });
-        vec![]
-    }
-
-    fn peek_key(&mut self, code: KeyCode) -> Vec<Effect> {
-        let page = self.peek_rows.saturating_sub(1).max(1);
-        let Mode::Peek(p) = &mut self.mode else {
-            return vec![];
-        };
-        match code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.mode = Mode::Normal,
-            KeyCode::Down => p.scroll += 1,
-            KeyCode::Up => p.scroll = p.scroll.saturating_sub(1),
-            KeyCode::PageDown | KeyCode::Char(' ') => p.scroll += page,
-            KeyCode::PageUp => p.scroll = p.scroll.saturating_sub(page),
-            KeyCode::Home => p.scroll = 0,
-            KeyCode::End => p.scroll = usize::MAX,
-            _ => {}
-        }
         vec![]
     }
 
@@ -792,18 +741,11 @@ impl App {
                         done = format!("created {name}");
                     }
                     Call::Rename { title, .. } => {
-                        let slug = slugify(&title);
                         if let Some(c) = &mut self.cursor
                             && c.col == job.col
                             && job.key.as_ref() == Some(&c.key)
                         {
-                            c.key.slug = slug.clone();
-                        }
-                        if let Mode::Peek(p) = &mut self.mode
-                            && p.col == job.col
-                            && job.key.as_ref() == Some(&p.key)
-                        {
-                            p.key.slug = slug;
+                            c.key.slug = slugify(&title);
                         }
                     }
                     _ => {}
@@ -877,9 +819,8 @@ impl App {
 
     // --- time --------------------------------------------------------------
 
-    /// The cursor hides after a minute without a key, restoring the idle
-    /// frame; a peek, a half-typed form or the view menu stays until
-    /// dismissed.
+    /// The cursor hides after a minute without a key. Forms and the view menu
+    /// stay until dismissed.
     pub fn tick(&mut self, now: Instant) {
         let row_bound = matches!(self.mode, Mode::Normal | Mode::Move(_) | Mode::Prio(_));
         if self.cursor.is_some() && row_bound && now.duration_since(self.last_key) >= CURSOR_TIMEOUT
@@ -889,28 +830,6 @@ impl App {
         }
         if self.message.as_ref().is_some_and(|m| now >= m.until) {
             self.message = None;
-        }
-    }
-
-    /// Re-read the peeked file when it changed on disk, following the task
-    /// when a move, a reprioritize or a rename changed its filename.
-    pub fn refresh_peek(&mut self) {
-        let project_dir = match &self.mode {
-            Mode::Peek(p) => self.tasks_root.join(&self.columns[p.col].project),
-            _ => return,
-        };
-        let Mode::Peek(p) = &mut self.mode else {
-            return;
-        };
-        if !p.path.is_file()
-            && let Some(path) = locate(&project_dir, &p.key)
-        {
-            p.path = path;
-        }
-        let stamp = watch::stamp(&p.path);
-        if stamp != p.stamp {
-            p.stamp = stamp;
-            p.text = fs::read_to_string(&p.path).ok();
         }
     }
 
@@ -958,23 +877,6 @@ pub const MOVES: [(char, Status); 5] = [
     ('d', Status::Done),
     ('c', Status::Canceled),
 ];
-
-/// A task's file wherever it now sits in the project, by id and slug.
-fn locate(project_dir: &Path, key: &TaskKey) -> Option<PathBuf> {
-    Status::ALL.iter().find_map(|s| {
-        fs::read_dir(project_dir.join(s.dir()))
-            .ok()?
-            .flatten()
-            .map(|e| e.path())
-            .find(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(TaskKey::from_filename)
-                    .as_ref()
-                    == Some(key)
-            })
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -1151,12 +1053,7 @@ mod tests {
     #[test]
     fn row_keys_never_act_without_a_cursor() {
         let (mut a, _tmp) = app(false);
-        for code in [
-            KeyCode::Enter,
-            KeyCode::Char('e'),
-            KeyCode::Char('m'),
-            KeyCode::Char('p'),
-        ] {
+        for code in [KeyCode::Enter, KeyCode::Char('m'), KeyCode::Char('p')] {
             assert_eq!(key(&mut a, code), vec![]);
             assert!(matches!(a.mode, Mode::Normal));
         }
@@ -1656,22 +1553,6 @@ mod tests {
     }
 
     #[test]
-    fn a_peek_follows_its_task_across_a_rename() {
-        let (mut a, tmp) = renaming_beta();
-        chars(&mut a, "-two");
-        let Some(Effect::Run(job)) = key(&mut a, KeyCode::Enter).into_iter().next() else {
-            panic!("no rename job")
-        };
-        key(&mut a, KeyCode::Enter);
-        let todo = tmp.path().join("proj/todo");
-        fs::rename(todo.join("N002-beta.md"), todo.join("N002-beta-two.md")).unwrap();
-        a.on_job_done(job, Ok(String::new()), Instant::now());
-        a.refresh_peek();
-        let Mode::Peek(p) = &a.mode else { panic!() };
-        assert_eq!(p.path, todo.join("N002-beta-two.md"));
-    }
-
-    #[test]
     fn the_second_columns_task_is_acted_on_in_its_project() {
         let (mut a, _tmp) = app(true);
         key(&mut a, KeyCode::Right); // N007, widget
@@ -1698,7 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn the_timeout_closes_a_row_menu_but_not_the_view_menu_a_form_or_a_peek() {
+    fn the_timeout_closes_row_menus_and_keeps_forms_and_the_view_menu() {
         let t0 = Instant::now();
         let later = t0 + CURSOR_TIMEOUT;
         for (open, survives) in [('m', false), ('p', false), ('n', true), ('v', true)] {
@@ -1710,11 +1591,6 @@ mod tests {
             assert_eq!(!matches!(a.mode, Mode::Normal), survives, "{open}");
             assert_eq!(a.cursor.is_some(), survives, "{open}: the cursor");
         }
-        let (mut a, _tmp) = app(false);
-        a.on_key(KeyEvent::from(KeyCode::Down), t0);
-        a.on_key(KeyEvent::from(KeyCode::Enter), t0);
-        a.tick(later);
-        assert!(matches!(a.mode, Mode::Peek(_)));
     }
 
     #[test]
@@ -1832,53 +1708,22 @@ mod tests {
     }
 
     #[test]
-    fn peek_opens_scrolls_and_closes() {
+    fn enter_on_a_row_opens_the_editor() {
         let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Down);
-        key(&mut a, KeyCode::Enter);
-        let Mode::Peek(p) = &a.mode else {
-            panic!("no peek")
-        };
-        assert_eq!(p.text.as_deref(), Some("# Busy\n\nbody\n"));
-        key(&mut a, KeyCode::Down);
-        key(&mut a, KeyCode::Down);
-        key(&mut a, KeyCode::Up);
-        let Mode::Peek(p) = &a.mode else { panic!() };
-        assert_eq!(p.scroll, 1);
-        assert_eq!(key(&mut a, KeyCode::Char('m')), vec![]);
+        let effects = key(&mut a, KeyCode::Enter);
         assert!(
-            matches!(a.mode, Mode::Peek(_)),
-            "row keys are off while peeking"
+            matches!(effects.as_slice(), [Effect::Edit(_)]),
+            "{effects:?}"
         );
-        for close in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('q')] {
-            key(&mut a, close);
-            assert!(matches!(a.mode, Mode::Normal));
-            key(&mut a, KeyCode::Enter);
-            assert!(matches!(a.mode, Mode::Peek(_)));
-        }
     }
 
     #[test]
-    fn peek_rereads_a_changed_file_and_follows_a_moved_one() {
-        let (mut a, tmp) = app(false);
+    fn e_on_a_row_does_nothing() {
+        let (mut a, _tmp) = app(false);
         key(&mut a, KeyCode::Down);
-        key(&mut a, KeyCode::Down); // N001
-        key(&mut a, KeyCode::Enter);
-        let todo = tmp.path().join("proj/todo/N001-alpha.md");
-        fs::write(&todo, "# Alpha, a good deal longer now\n").unwrap();
-        a.refresh_peek();
-        let Mode::Peek(p) = &a.mode else { panic!() };
-        assert_eq!(p.text.as_deref(), Some("# Alpha, a good deal longer now\n"));
-
-        fs::rename(&todo, tmp.path().join("proj/done/H001-alpha.md")).unwrap();
-        a.refresh_peek();
-        let Mode::Peek(p) = &a.mode else { panic!() };
-        assert_eq!(p.path, tmp.path().join("proj/done/H001-alpha.md"));
-
-        fs::remove_file(&p.path).unwrap();
-        a.refresh_peek();
-        let Mode::Peek(p) = &a.mode else { panic!() };
-        assert_eq!(p.text, None);
+        assert_eq!(key(&mut a, KeyCode::Char('e')), vec![]);
+        assert!(matches!(a.mode, Mode::Normal));
     }
 
     #[test]
@@ -1886,7 +1731,7 @@ mod tests {
         let (mut a, _tmp) = app(false);
         a.editor = None;
         key(&mut a, KeyCode::Down);
-        assert_eq!(key(&mut a, KeyCode::Char('e')), vec![]);
+        assert_eq!(key(&mut a, KeyCode::Enter), vec![]);
         let m = a.message.as_ref().unwrap();
         assert!(
             m.error && m.text.contains("export EDITOR=micro"),
@@ -1896,7 +1741,7 @@ mod tests {
     }
 
     fn edit_of(a: &mut App) -> Edit {
-        match key(a, KeyCode::Char('e')).into_iter().next() {
+        match key(a, KeyCode::Enter).into_iter().next() {
             Some(Effect::Edit(e)) => e,
             other => panic!("no edit: {other:?}"),
         }

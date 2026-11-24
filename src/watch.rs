@@ -33,7 +33,7 @@ pub fn signature(projects: &[PathBuf]) -> Vec<(PathBuf, Stamp)> {
     sig
 }
 
-pub fn stamp(path: &Path) -> Option<Stamp> {
+fn stamp(path: &Path) -> Option<Stamp> {
     let m = fs::metadata(path).ok()?;
     m.is_file()
         .then(|| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()))

@@ -1,6 +1,6 @@
 //! Taskania, the task tool: verbs that list and change tasks, and a dashboard
-//! (`--watch`) showing one or two projects' queues live, with a cursor to peek,
-//! edit, create, move, reprioritize and rename tasks.
+//! (`--watch`) showing one or two projects' queues live, with a cursor to edit,
+//! create, move, reprioritize and rename tasks.
 
 mod app;
 mod args;
@@ -273,7 +273,6 @@ fn run_loop(
         if now >= next_poll {
             next_poll = now + POLL;
             changed |= watch::signature(&dirs) != sig;
-            app.refresh_peek();
         }
         if changed {
             // Signature first: a change landing during the listing shows up

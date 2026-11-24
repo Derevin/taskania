@@ -2,7 +2,7 @@
 //! the body cut to `rows-1` lines and `  +N (+M) more` (open tasks cut, then
 //! done and canceled), a second column as wide as its longest line (at most
 //! half the pane) flush with the right edge. On top of it: the cursor, the bar,
-//! the move, priority and view prompts, the task form and the peek overlay.
+//! the move, priority and view prompts, and the task form.
 
 use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::layout::{Position, Rect};
@@ -16,16 +16,12 @@ use crate::listing::{Row, Task};
 const GUTTER: usize = 2;
 const IDLE_HINTS: [&str; 2] = ["(↑↓←→ select, n new, v view, q)", "(↑↓←→ n v q)"];
 const CURSOR_HINTS: [&str; 2] = [
-    "(⏎ peek, e edit, m move, p prio, r rename, n new, v view, esc)",
-    "(⏎ e m p r n v esc)",
+    "(⏎ edit, m move, p prio, r rename, n new, v view, esc)",
+    "(⏎ m p r n v esc)",
 ];
 
 /// Draw the pane. Returns where the text cursor belongs, if it shows at all.
 pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) -> Option<Position> {
-    if matches!(app.mode, Mode::Peek(_)) {
-        render_peek(area, buf, app);
-        return None;
-    }
     let form = matches!(app.mode, Mode::Form(_));
     let foot_height = if form { 3 } else { 1 }.min(area.height);
     let body = Rect {
@@ -393,100 +389,6 @@ fn title_window(f: &Form, width: usize) -> (usize, usize) {
     (start, width_of(&f.title[start..f.pos]))
 }
 
-/// The task file, wrapped, over the whole pane: its path on top, keys below.
-fn render_peek(area: Rect, buf: &mut Buffer, app: &mut App) {
-    let (w, h) = (area.width as usize, area.height as usize);
-    if w == 0 || h == 0 {
-        return;
-    }
-    let content_h = h.saturating_sub(2);
-    let root = app.tasks_root.clone();
-    let Mode::Peek(p) = &mut app.mode else { return };
-    let title = p
-        .path
-        .strip_prefix(&root)
-        .unwrap_or(&p.path)
-        .display()
-        .to_string();
-    let reversed = Style::new().add_modifier(Modifier::REVERSED);
-    buf.set_style(Rect { height: 1, ..area }, reversed);
-    buf.set_stringn(area.x, area.y, title, w, reversed);
-
-    let dim = Style::new().add_modifier(Modifier::DIM);
-    let (lines, style) = match &p.text {
-        Some(t) if t.is_empty() => (vec!["(empty file)".to_string()], dim),
-        Some(t) => (wrap(t, w), Style::new()),
-        None => (vec!["(the file is gone)".to_string()], dim),
-    };
-    p.scroll = p.scroll.min(lines.len().saturating_sub(content_h));
-    for (i, line) in lines.iter().skip(p.scroll).take(content_h).enumerate() {
-        buf.set_stringn(area.x, area.y + 1 + i as u16, line, w, style);
-    }
-    if h >= 2 {
-        let last = lines.len().min(p.scroll + content_h);
-        let pos = format!("{}-{}/{}", (p.scroll + 1).min(last), last, lines.len());
-        let keys = "↑↓ PgUp PgDn scroll, esc close";
-        let y = area.y + area.height - 1;
-        buf.set_stringn(area.x, y, keys, w, dim);
-        let pw = text_width(&pos);
-        if text_width(keys) + 1 + pw <= w {
-            buf.set_stringn(area.x + (w - pw) as u16, y, pos, pw, dim);
-        }
-    }
-    app.peek_rows = content_h;
-}
-
-/// Lines of `text` wrapped to `width` cells: at a space where one falls in the
-/// line, mid-word where none does. Tabs become spaces.
-pub fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = Vec::new();
-    for raw in text.strip_suffix('\n').unwrap_or(text).split('\n') {
-        let mut line = String::new();
-        let mut line_w = 0;
-        // Byte index and width just past the line's last space.
-        let mut space: Option<(usize, usize)> = None;
-        for ch in raw.chars() {
-            let (ch, n) = match ch {
-                '\t' => (' ', 4),
-                c if c.is_control() => continue,
-                c => (c, 1),
-            };
-            let cw = char_width(ch);
-            for _ in 0..n {
-                // A space that would overflow ends the line instead.
-                if ch == ' ' && line_w + cw > width {
-                    out.push(std::mem::take(&mut line).trim_end().to_string());
-                    line_w = 0;
-                    space = None;
-                    continue;
-                }
-                while line_w + cw > width && !line.is_empty() {
-                    match space.take() {
-                        Some((at, w)) if at < line.len() => {
-                            let rest = line.split_off(at);
-                            out.push(line.trim_end().to_string());
-                            line = rest;
-                            line_w -= w;
-                        }
-                        _ => {
-                            out.push(std::mem::take(&mut line).trim_end().to_string());
-                            line_w = 0;
-                        }
-                    }
-                }
-                line.push(ch);
-                line_w += cw;
-                if ch == ' ' {
-                    space = Some((line.len(), line_w));
-                }
-            }
-        }
-        out.push(line);
-    }
-    out
-}
-
 fn char_width(c: char) -> usize {
     let mut b = [0; 4];
     c.encode_utf8(&mut b).cell_width() as usize
@@ -525,7 +427,6 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyCode;
-    use std::fs;
 
     fn modifier(t: &Terminal<TestBackend>, x: u16, y: u16) -> Modifier {
         t.backend().buffer()[(x, y)].modifier
@@ -643,7 +544,7 @@ mod tests {
         );
         assert!(!modifier(&t, 0, 3).contains(Modifier::REVERSED));
         assert!(
-            lines(&t)[11].contains("(⏎ e m p r n v esc)"),
+            lines(&t)[11].contains("(⏎ m p r n v esc)"),
             "the bar shows the row keys"
         );
     }
@@ -717,7 +618,7 @@ mod tests {
         key(&mut a, KeyCode::Down);
         assert_eq!(
             lines(&draw(&mut a, 100, 4))[3],
-            format!("{left} (⏎ peek, e edit, m move, p prio, r rename, n new, v view, esc)")
+            format!("{left} (⏎ edit, m move, p prio, r rename, n new, v view, esc)")
         );
     }
 
@@ -905,57 +806,5 @@ mod tests {
         let mut t = draw(&mut a, 20, 6);
         assert_eq!(lines(&t)[4], "│N   ││pqrstuvwxyz │");
         assert_eq!(t.get_cursor_position().unwrap(), Position::new(18, 4));
-    }
-
-    #[test]
-    fn peek_overlays_the_pane_with_the_file() {
-        let (mut a, tmp) = app(false);
-        let body =
-            "# Busy\nsecond\n\nA paragraph long enough that it has to wrap at the pane's edge.\n";
-        fs::write(tmp.path().join("proj/active/H010-busy.md"), body).unwrap();
-        key(&mut a, KeyCode::Down);
-        key(&mut a, KeyCode::Enter);
-        let t = draw(&mut a, 30, 8);
-        let got = lines(&t);
-        assert_eq!(got[0], "proj/active/H010-busy.md");
-        assert!(modifier(&t, 0, 0).contains(Modifier::REVERSED));
-        assert_eq!(
-            &got[1..6],
-            [
-                "# Busy",
-                "second",
-                "",
-                "A paragraph long enough that",
-                "it has to wrap at the pane's"
-            ]
-        );
-        assert!(got[7].starts_with("↑↓ PgUp PgDn scroll"));
-        assert_eq!(a.peek_rows, 6);
-
-        key(&mut a, KeyCode::PageDown);
-        let got = lines(&draw(&mut a, 30, 7));
-        assert_eq!(got[1], "second", "scrolled to the end, no further");
-    }
-
-    #[test]
-    fn peek_says_when_the_file_is_empty_or_gone() {
-        let (mut a, tmp) = app(false);
-        key(&mut a, KeyCode::Down);
-        key(&mut a, KeyCode::Down);
-        key(&mut a, KeyCode::Down); // N002, empty
-        key(&mut a, KeyCode::Enter);
-        assert_eq!(lines(&draw(&mut a, 30, 6))[1], "(empty file)");
-        fs::remove_file(tmp.path().join("proj/todo/N002-beta.md")).unwrap();
-        a.refresh_peek();
-        assert_eq!(lines(&draw(&mut a, 30, 6))[1], "(the file is gone)");
-    }
-
-    #[test]
-    fn wrapping_breaks_at_spaces_and_mid_word_when_it_must() {
-        assert_eq!(wrap("one two three", 7), ["one two", "three"]);
-        assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
-        assert_eq!(wrap("a\n\nb\n", 10), ["a", "", "b"]);
-        assert_eq!(wrap("\tx", 10), ["    x"]);
-        assert_eq!(wrap("", 10), [""]);
     }
 }

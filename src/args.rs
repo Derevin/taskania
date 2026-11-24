@@ -23,15 +23,14 @@ A change pulls the tasks repo first, then commits and pushes it.
 taskania VERB --help explains a verb; taskania --watch --help the dashboard.";
 
 pub const WATCH_HELP: &str = "\
-Taskania's dashboard: the cwd's project's tasks, live, with a cursor to peek, edit, create, move, reprioritize and rename them.
+Taskania's dashboard: the cwd's project's tasks, live, with a cursor to edit, create, move, reprioritize and rename them.
 Usage: taskania --watch [--with NAME]
 --with draws a second project's list right-aligned beside it.
 Below the open queue come done then canceled since a marker 7 days back.
 Keys: up/down move the row cursor, left/right hop to that column, esc hides it.
-On a row: enter peeks, e edits, m moves, p sets the priority, r renames. n creates a task.
+On a row: enter edits, m moves, p sets the priority, r renames. n creates a task.
 v opens the view menu: left/right move the done-since marker, enter applies it,
-d s toggle row dates and the stale section, esc closes. q or ctrl-c quits.
-In a peek: up/down scroll, pgdn/space and pgup page, home/end jump, esc/enter/q close.";
+d s toggle row dates and the stale section, esc closes. q or ctrl-c quits.";
 
 /// A verb's name, the help it prints, and whether it takes `--project`.
 struct Spec {
